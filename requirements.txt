@@ -1,0 +1,5 @@
+streamlit
+pypdf
+rispy
+python-dotenv
+requests
