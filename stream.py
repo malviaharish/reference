@@ -1,7 +1,7 @@
 import re
 import requests
 import streamlit as st
-from pypdf import PdfReader
+from PyPDF2 import PdfReader
 import io
 
 
@@ -618,3 +618,4 @@ if 'results' in st.session_state and st.session_state.results:
 
 st.divider()
 st.caption("This tool uses the Crossref API to search for DOIs and convert references to multiple citation formats.")
+
