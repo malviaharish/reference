@@ -284,7 +284,7 @@ def convert_to_apa(item):
 
 st.set_page_config(page_title="Reference Converter", page_icon="📚", layout="wide")
 
-st.title("📚 Academic Reference Converter")
+st.title("📚 Reference Converter")
 st.markdown("Convert your numbered academic references into multiple citation formats using the Crossref API")
 
 input_method = st.radio(
@@ -618,3 +618,4 @@ if 'results' in st.session_state and st.session_state.results:
 
 st.divider()
 st.caption("This tool uses the Crossref API to search for DOIs and convert references to multiple citation formats.")
+
