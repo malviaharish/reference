@@ -4,3 +4,4 @@ rispy
 python-dotenv
 requests
 PyPDF2
+scholarly
