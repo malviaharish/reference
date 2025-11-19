@@ -240,16 +240,6 @@ def search_google_scholar(query):
     except Exception as e:
         return {"error": str(e)}
 
-st.title("Google Scholar Search (No API Needed)")
-query = st.text_input("Enter title or DOI")
-
-if st.button("Search"):
-    with st.spinner("Searching Google Scholar..."):
-        result = search_google_scholar(query)
-
-    st.write(result)
-
-
 # ----------------------------
 # Converters: RIS / BibTeX / EndNote / APA
 # ----------------------------
@@ -543,4 +533,5 @@ if "last_results" in st.session_state:
                 st.code(final, language="text")
 
 st.caption("This app queries Crossref and PubMed. Google Scholar fallback via SerpAPI is optional. Add 'SERPAPI_KEY' in Streamlit secrets to enable Scholar search. For large batches consider adding a mailto param and/or longer delays.")
+
 
