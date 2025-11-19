@@ -3,3 +3,4 @@ pypdf
 rispy
 python-dotenv
 requests
+PyPDF2
