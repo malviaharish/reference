@@ -1,68 +1,74 @@
-# streamlit_ref_tool_final.py
+# streamlit_ref_tool_openai.py
 """
-Reference → DOI → RIS/BibTeX Streamlit app (final)
-Features:
- - Input: Paste references or upload PDF(s)
- - Search order: Crossref -> PubMed (full, then title) -> Semantic Scholar
- - Hybrid AI Parser (Mode B) for offline parsing when search fails or when search result does not match input
- - Auto cross-check: if search result similarity < threshold -> use raw->RIS automatically (can override)
- - Deduplication, editing, export RIS/BibTeX/CSV
+Reference → DOI → RIS/BibTeX Streamlit app (OpenAI-assisted parsing)
+Search order: Crossref (title) -> PubMed (title/full) -> Semantic Scholar
+If search metadata matches pasted reference (authors & year & journal similarity) => use DOI/metadata
+Else => parse pasted reference with OpenAI -> convert parsed metadata to RIS
 """
 
+import os
 import re
 import time
-import hashlib
-import difflib
+import json
 import csv
 import io
+import hashlib
+import difflib
 from typing import List, Tuple, Optional, Dict, Any
 
 import requests
 import streamlit as st
 from pypdf import PdfReader
 
-# ----------------------------
+# -----------------------
+# Config / secrets
+# -----------------------
+OPENAI_API_KEY = None
+if "OPENAI_API_KEY" in st.secrets:
+    OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
+else:
+    # also check env fallback
+    OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+
+# -------------
 # Utilities
-# ----------------------------
+# -------------
 def normalize_text(s: str) -> str:
     if not s:
         return ""
     return re.sub(r"\s+", " ", s).strip()
 
-def similarity(a: str, b: Optional[str]) -> float:
+def sim(a: str, b: str) -> float:
     if not a or not b:
         return 0.0
     return difflib.SequenceMatcher(None, normalize_text(a).lower(), normalize_text(b).lower()).ratio()
 
 DOI_RE = re.compile(r"10\.\d{4,9}/[-._;()/:A-Za-z0-9]+")
 
-# ----------------------------
+# -------------
 # PDF extraction
-# ----------------------------
-def extract_text_from_pdf_file(uploaded) -> str:
+# -------------
+def extract_text_from_pdf(uploaded) -> str:
     try:
         reader = PdfReader(uploaded)
         pages = []
         for p in reader.pages:
-            txt = p.extract_text()
-            if txt:
-                pages.append(txt)
+            t = p.extract_text()
+            if t:
+                pages.append(t)
         return "\n".join(pages)
     except Exception as e:
         return f"ERROR_PDF_EXTRACT: {e}"
 
-# ----------------------------
+# -------------
 # Clean & split references
-# ----------------------------
+# -------------
 def clean_and_join_broken_lines(text: str) -> str:
     if text is None:
         return ""
     text = text.replace("\r\n", "\n").replace("\r", "\n")
-    # fix hyphenation across line breaks: "adhe\n-sives" -> adhesives
-    text = re.sub(r"(\w+)-\s*\n\s*(\w+)", r"\1\2", text)
-    # join single newlines inside paragraphs to spaces
-    text = re.sub(r"(?<!\n)\n(?!\n)", " ", text)
-    # collapse multiple spaces
+    text = re.sub(r"(\w+)-\s*\n\s*(\w+)", r"\1\2", text)  # fix hyphenation
+    text = re.sub(r"(?<!\n)\n(?!\n)", " ", text)  # join single newlines
     text = re.sub(r"[ \t]{2,}", " ", text)
     return text.strip()
 
@@ -70,15 +76,13 @@ def split_references_smart(text: str) -> List[str]:
     if not text:
         return []
     text = clean_and_join_broken_lines(text)
-
-    # If explicit numeric markers present, split by them
+    # numeric markers
     if re.search(r"(?:^|\n)\s*(?:\[\d+\]|\d+[\.\)])\s+", text):
         parts = re.split(r"(?:\n\s*)?(?:\[\d+\]|\d+[\.\)])\s*", text)
         parts = [p.strip() for p in parts if len(p.strip()) > 10]
         if parts:
             return parts
-
-    # Heuristic split on ". " followed by capital letter or bracket
+    # heuristic split
     cand = re.split(r"\.\s+(?=[A-Z\[])", text)
     results = []
     for c in cand:
@@ -86,12 +90,11 @@ def split_references_smart(text: str) -> List[str]:
         if not c:
             continue
         if not c.endswith("."):
-            c = c + "."
+            c += "."
         if len(c) < 30 and results:
             results[-1] = results[-1].rstrip(".") + " " + c
         else:
             results.append(c)
-    # merge fragments that are unlikely complete references
     final = []
     for r in results:
         if final and (len(r) < 60 and not re.search(r"\b(19|20)\d{2}\b", r)):
@@ -101,200 +104,218 @@ def split_references_smart(text: str) -> List[str]:
     final = [re.sub(r"\s+", " ", f).strip() for f in final if f.strip()]
     return final
 
-# ----------------------------
-# Hybrid AI Parser (Mode B)
-# ----------------------------
-def split_title_and_journal(ref_text: str) -> Tuple[str, str]:
+# -----------------------
+# Reference style detection
+# -----------------------
+def detect_reference_style(text: str) -> Tuple[str, str]:
+    text_lower = text.lower() if text else ""
+    scores = {"Vancouver":0, "APA":0, "MLA":0, "Chicago":0}
+    # Vancouver cues: semicolon with year "2005;17" or year;vol:pages
+    scores["Vancouver"] += len(re.findall(r"\b(19|20)\d{2}\s*;\s*\d+", text))
+    # APA cues: (Year) in parentheses after authors
+    scores["APA"] += len(re.findall(r"\([1-2][0-9]{3}\)", text))
+    # MLA cues: quotes around titles
+    scores["MLA"] += text.count('"') + text.count('“') + text.count('”')
+    # Chicago: footnote numeric patterns maybe
+    scores["Chicago"] += len(re.findall(r"^\s*\d+\.\s", text, flags=re.M))
+    best = max(scores, key=scores.get)
+    conf = "Low"
+    if scores[best] >= 4:
+        conf = "High"
+    elif scores[best] >= 1:
+        conf = "Medium"
+    if all(v == 0 for v in scores.values()):
+        return "Unknown", "Low"
+    return best, conf
+
+# -----------------------
+# OpenAI-based parser (structured JSON extraction)
+# -----------------------
+def openai_parse_reference(ref_text: str) -> Optional[Dict[str, Any]]:
     """
-    Robustly split an inline string where title and journal appear
-    Example: "Horsley’s wax. J Perioper Pract. 2007;17:82–84."
-      -> ("Horsley’s wax", "J Perioper Pract")
+    Use the OpenAI Chat Completions (or standard completions) endpoint to
+    convert a pasted reference into JSON with keys:
+    authors (list of strings), title, journal, year, volume, issue, pages, doi
     """
-    text = " ".join(ref_text.split())
-    # find year to define boundary
-    year_match = re.search(r"(19|20)\d{2}", text)
-    if year_match:
-        year_pos = year_match.start()
-        left = text[:year_pos].strip()
-    else:
-        left = text
+    if not OPENAI_API_KEY:
+        return None
 
-    # split left by period/ dot into parts
-    parts = [p.strip() for p in left.split(".") if p.strip()]
-    if len(parts) == 0:
-        return "", ""
-    if len(parts) == 1:
-        # nothing to separate; return part as title, journal unknown
-        return parts[0], ""
-    # else first part is likely title, remainder journal pieces
-    title = parts[0]
-    journal = " ".join(parts[1:])
-    # Remove trailing numeric fragments from journal (like volume accidentally captured)
-    journal = re.sub(r"\b\d+.*$", "", journal).strip()
-    return title.strip().rstrip("."), journal.strip().rstrip(".")
+    prompt = f"""You are a precise metadata extractor. Convert the following single bibliographic reference into a JSON object with these exact fields:
+- authors: array of strings (each "Family, Given" or "Family GivenInitials")
+- title: string
+- journal: string
+- year: string (4-digit) or empty
+- volume: string or empty
+- issue: string or empty
+- pages: string or empty (e.g., "82-84")
+- doi: string or empty
 
-def hybrid_parse_reference(ref: str) -> Dict[str, Any]:
-    """
-    Hybrid parser combining regex heuristics + small patterns to extract:
-    authors (list of strings), year, title, journal, volume, issue, pages, doi
-    """
-    parsed = {"authors": [], "year": None, "title": "", "journal": "", "volume": "", "issue": "", "pages": "", "doi": None}
-    text = clean_and_join_broken_lines(ref)
+Return ONLY valid JSON. Do not include any explanation.
 
-    # DOI (if present)
-    doi_m = DOI_RE.search(text)
-    if doi_m:
-        parsed["doi"] = doi_m.group(0).rstrip(".,;")
+Reference:
+\"\"\"{ref_text}\"\"\"
 
-    # Year
-    year_m = re.search(r"\((19|20)\d{2}\)|\b(19|20)\d{2}\b", text)
-    if year_m:
-        parsed["year"] = year_m.group(0).strip("()")
+If a field cannot be determined, set it to an empty string or empty list for authors.
+"""
 
-    # Try to isolate authors: often before the first period if it contains names/commas
-    first_period_split = re.split(r"\.\s+", text, maxsplit=1)
-    if len(first_period_split) >= 2:
-        maybe_authors = first_period_split[0].strip()
-        remainder = first_period_split[1].strip()
-        # Heuristics to determine if the first chunk is authors:
-        if ("," in maybe_authors) or re.search(r"\b[A-Z][a-z]{1,}\s+[A-Z]\.?", maybe_authors) or len(maybe_authors.split())<=6:
-            # split authors by semicolon or comma between names
-            authors_raw = re.split(r";\s*|\.\s*|\s{2,}|,\s*(?=[A-Z][a-z])", maybe_authors)
-            # fallback comma split
-            if len(authors_raw) == 1:
-                authors_raw = re.split(r",\s*", maybe_authors)
-            authors = [a.strip().rstrip(".") for a in authors_raw if a.strip()]
-            parsed["authors"] = authors
-            # For title/journal separation, try split_title_and_journal on remainder
-            title_guess, journal_guess = split_title_and_journal(remainder)
-            if title_guess:
-                parsed["title"] = title_guess
-            if journal_guess:
-                parsed["journal"] = journal_guess
-        else:
-            # can't confidently parse authors; try to find quoted title or pattern
-            q = re.search(r'“([^”]+)”|\"([^\"]+)\"|\'([^\']+)\'', text)
-            if q:
-                parsed["title"] = next(g for g in q.groups() if g)
-            else:
-                # Use split_title_and_journal on whole text
-                title_guess, journal_guess = split_title_and_journal(text)
-                parsed["title"] = title_guess or parsed["title"]
-                parsed["journal"] = journal_guess or parsed["journal"]
-    else:
-        # Single segment; try to extract quotes or title/journal pattern
-        q = re.search(r'“([^”]+)”|\"([^\"]+)\"', text)
-        if q:
-            parsed["title"] = next(g for g in q.groups() if g)
-        else:
-            t,j = split_title_and_journal(text)
-            parsed["title"] = t
-            parsed["journal"] = j
+    # Use Chat Completions API (OpenAI). We'll call v1/chat/completions with gpt-4o-mini or gpt-4o.
+    # Fallback to text-davinci-003 style if needed.
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+    data = {
+        "model": "gpt-4o-mini",  # if not available, user can change to a preferred model in secrets
+        "messages": [{"role":"user","content":prompt}],
+        "temperature": 0.0,
+        "max_tokens": 600
+    }
+    try:
+        resp = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, data=json.dumps(data), timeout=20)
+        resp.raise_for_status()
+        j = resp.json()
+        # Extract assistant content
+        content = j["choices"][0]["message"]["content"]
+        # Parse JSON (assistant should respond with JSON)
+        parsed_json = json.loads(content)
+        # Normalize fields and return
+        out = {
+            "authors": parsed_json.get("authors", []),
+            "title": parsed_json.get("title", "").strip(),
+            "journal": parsed_json.get("journal", "").strip(),
+            "year": str(parsed_json.get("year","")).strip(),
+            "volume": parsed_json.get("volume","").strip(),
+            "issue": parsed_json.get("issue","").strip(),
+            "pages": parsed_json.get("pages","").strip(),
+            "doi": parsed_json.get("doi","").strip()
+        }
+        return out
+    except Exception as e:
+        # If OpenAI call/parsing fails, return None
+        return None
 
-    # Volume / issue / pages extraction (common Vancouver patterns)
-    m = re.search(r"(?P<year>(19|20)\d{2})\s*;\s*(?P<vol>\d+)(?:\((?P<iss>\d+)\))?\s*:\s*(?P<pages>[\d\-–]+)", text)
+# -----------------------
+# Light fallback parser (if OpenAI not available)
+# -----------------------
+def fallback_local_parse(ref_text: str) -> Dict[str, Any]:
+    # Simple heuristics to extract fields (less accurate)
+    parsed = {"authors": [], "title": "", "journal": "", "year": "", "volume": "", "issue": "", "pages": "", "doi": ""}
+    text = clean_and_join_broken_lines(ref_text)
+    # doi
+    m = DOI_RE.search(text)
     if m:
-        parsed["year"] = parsed["year"] or m.group("year")
-        parsed["volume"] = m.group("vol") or ""
-        parsed["issue"] = m.group("iss") or ""
-        parsed["pages"] = m.group("pages") or ""
-        # if journal not detected, attempt to find journal before the year
-        if not parsed["journal"]:
-            jmatch = re.search(r"([A-Za-z\.\s&\-:]{3,}?)\.\s*" + re.escape(m.group(0)))
-            if jmatch:
-                parsed["journal"] = jmatch.group(1).strip().rstrip(".")
+        parsed["doi"] = m.group(0).rstrip(',.')
+    # year
+    ym = re.search(r"\b(19|20)\d{2}\b", text)
+    if ym:
+        parsed["year"] = ym.group(0)
+    # split at first period
+    parts = re.split(r"\.\s+", text, maxsplit=1)
+    if len(parts) >= 2:
+        first = parts[0].strip()
+        rest = parts[1].strip()
+        # authors if contains comma and initials
+        if re.search(r"\b[A-Z][a-z]+,?\s+[A-Z]\.?", first) or ("," in first and len(first.split()) <= 6):
+            parsed["authors"] = [a.strip().rstrip('.') for a in re.split(r";|, (?=[A-Z][a-z])", first) if a.strip()]
+            title_guess, journal_guess = split_title_and_journal(rest)
+            parsed["title"] = title_guess
+            parsed["journal"] = journal_guess
+        else:
+            # maybe "Title. Journal. Year;Vol:Pages"
+            title_guess, journal_guess = split_title_and_journal(text)
+            parsed["title"] = title_guess
+            parsed["journal"] = journal_guess
     else:
-        # alternate pattern: Journal. YEAR;VOL:PGS
-        m2 = re.search(r"(?P<journal>[A-Za-z\.\s&\-:]{3,}?)\.\s*(?P<year>(19|20)\d{2})\s*;\s*(?P<vol>\d+)\s*:\s*(?P<pages>[\d\-–]+)", text)
-        if m2:
-            parsed["journal"] = parsed["journal"] or m2.group("journal").strip().rstrip(".")
-            parsed["year"] = parsed["year"] or m2.group("year")
-            parsed["volume"] = m2.group("vol") or ""
-            parsed["pages"] = m2.group("pages") or ""
-
-    # Also attempt to parse pages in simple patterns
-    page_m = re.search(r":\s*(\d+[\-–]\d+|\d+)\b", text)
-    if page_m and not parsed["pages"]:
-        parsed["pages"] = page_m.group(1)
-
-    # Final cleanup: strip whitespace
-    parsed["title"] = parsed["title"].strip()
-    parsed["journal"] = parsed["journal"].strip()
-    parsed["pages"] = parsed["pages"].strip()
-    parsed["volume"] = parsed["volume"].strip()
-    parsed["issue"] = parsed["issue"].strip()
-    parsed["authors"] = [a.strip() for a in parsed["authors"] if a.strip()]
+        title_guess, journal_guess = split_title_and_journal(text)
+        parsed["title"] = title_guess
+        parsed["journal"] = journal_guess
+    # pages / vol
+    vp = re.search(r"(?P<vol>\d+)\s*\(?\s*(?P<iss>\d+)?\s*\)?\s*:\s*(?P<pages>[\d\-–]+)", text)
+    if vp:
+        parsed["volume"] = vp.group("vol") or ""
+        parsed["issue"] = vp.group("iss") or ""
+        parsed["pages"] = vp.group("pages") or ""
+    else:
+        # alternate :pages only
+        pm = re.search(r":\s*(\d+[-–]\d+|\d+)\b", text)
+        if pm:
+            parsed["pages"] = pm.group(1)
     return parsed
 
-# ----------------------------
-# Crossref search (title-based / DOI direct)
-# ----------------------------
-def crossref_search(ref_text: str) -> Tuple[Optional[Dict[str,Any]], Optional[str]]:
-    # direct DOI first
-    try:
-        doi_m = DOI_RE.search(ref_text)
-        if doi_m:
-            doi = doi_m.group(0).rstrip(".,;")
-            url = f"https://api.crossref.org/works/{doi}"
-            r = requests.get(url, timeout=12)
-            if r.status_code == 200:
-                item = r.json().get("message")
-                return item, doi
-    except Exception:
-        pass
+# Helper used by fallback_local_parse & openai fallback
+def split_title_and_journal(ref_text: str) -> Tuple[str,str]:
+    text = " ".join(ref_text.split())
+    # use year boundary if present
+    ym = re.search(r"\b(19|20)\d{2}\b", text)
+    left = text[:ym.start()] if ym else text
+    parts = [p.strip() for p in left.split(".") if p.strip()]
+    if len(parts) <= 1:
+        # nothing to split
+        if len(parts) == 1:
+            return parts[0], ""
+        return "", ""
+    title = parts[0]
+    journal = " ".join(parts[1:])
+    journal = re.sub(r"\b\d+.*$", "", journal).strip()
+    return title.rstrip("."), journal.rstrip(".")
 
-    # build title-like query
+# -----------------------
+# Crossref / PubMed / Semantic Scholar searches (title-based)
+# -----------------------
+def crossref_search_by_title(title: str) -> Tuple[Optional[Dict[str,Any]], Optional[str]]:
     try:
-        split_on = re.split(r"\b(19|20)\d{2}\b", ref_text)
-        title_guess = split_on[0] if split_on else ref_text
-        title_guess = re.sub(r"\bvol\.?.*$", "", title_guess, flags=re.I).strip()
-        if not title_guess:
-            title_guess = ref_text[:200]
-        params = {"query.title": title_guess[:240], "rows": 1}
+        if not title:
+            return None, None
+        params = {"query.title": title[:240], "rows": 3}
         r = requests.get("https://api.crossref.org/works", params=params, timeout=12)
         r.raise_for_status()
         items = r.json().get("message", {}).get("items", [])
-        if items:
-            return items[0], items[0].get("DOI")
+        if not items:
+            return None, None
+        # pick best by title similarity
+        best = None
+        best_score = 0.0
+        for it in items:
+            t = (it.get("title") or [""])[0]
+            s = sim(title, t)
+            if s > best_score:
+                best_score = s
+                best = it
+        if best:
+            return best, best.get("DOI")
     except Exception:
-        pass
+        return None, None
     return None, None
 
-# ----------------------------
-# PubMed search (two-pass)
-# ----------------------------
-def pubmed_search_full(ref_text: str) -> Tuple[Optional[Dict[str,Any]], Optional[str]]:
+def pubmed_search_by_title(title: str) -> Tuple[Optional[Dict[str,Any]], Optional[str]]:
     try:
+        if not title:
+            return None, None
         base = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
-        params = {"db":"pubmed", "term": ref_text, "retmode":"json", "retmax":1}
+        params = {"db":"pubmed", "term": title, "retmode":"json", "retmax":3}
         r = requests.get(base, params=params, timeout=12)
         r.raise_for_status()
         ids = r.json().get("esearchresult", {}).get("idlist", [])
         if not ids:
             return None, None
-        pmid = ids[0]
-        return pubmed_fetch(pmid)
+        # fetch top 3, choose best by title similarity
+        best_item = None
+        best_score = 0.0
+        for pmid in ids[:3]:
+            item, doi = pubmed_fetch(pmid)
+            if item:
+                t = (item.get("title") or [""])[0] if isinstance(item.get("title"), list) else item.get("title","")
+                s = sim(title, t)
+                if s > best_score:
+                    best_score = s
+                    best_item = (item, doi)
+        if best_item:
+            return best_item
     except Exception:
         return None, None
-
-def pubmed_search_title_only(title: str) -> Tuple[Optional[Dict[str,Any]], Optional[str]]:
-    try:
-        base = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
-        params = {"db":"pubmed", "term": title, "retmode":"json", "retmax":1}
-        r = requests.get(base, params=params, timeout=12)
-        r.raise_for_status()
-        ids = r.json().get("esearchresult", {}).get("idlist", [])
-        if not ids:
-            return None, None
-        pmid = ids[0]
-        return pubmed_fetch(pmid)
-    except Exception:
-        return None, None
+    return None, None
 
 def pubmed_fetch(pmid: str) -> Tuple[Optional[Dict[str,Any]], Optional[str]]:
     try:
-        fetch_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
-        r = requests.get(fetch_url, params={"db":"pubmed", "id":pmid, "retmode":"xml"}, timeout=12)
+        fetch = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
+        r = requests.get(fetch, params={"db":"pubmed", "id": pmid, "retmode":"xml"}, timeout=12)
         r.raise_for_status()
         xml = r.text
         title_m = re.search(r"<ArticleTitle>(.*?)</ArticleTitle>", xml, re.S)
@@ -312,12 +333,12 @@ def pubmed_fetch(pmid: str) -> Tuple[Optional[Dict[str,Any]], Optional[str]]:
                 authors.append({"family": last.group(1).strip(), "given": fore.group(1).strip() if fore else ""})
         pages_m = re.search(r"<MedlinePgn>(.*?)</MedlinePgn>", xml)
         pages = pages_m.group(1).strip() if pages_m else ""
-        vol_m = re.search(r"<Volume>(.*?)</Volume>", xml)
-        issue_m = re.search(r"<Issue>(.*?)</Issue>", xml)
         doi_m = re.search(r'<ArticleId IdType="doi">(.+?)</ArticleId>', xml)
-        vol = vol_m.group(1).strip() if vol_m else ""
-        issue = issue_m.group(1).strip() if issue_m else ""
         doi = doi_m.group(1).strip() if doi_m else ""
+        vol_m = re.search(r"<Volume>(.*?)</Volume>", xml)
+        vol = vol_m.group(1).strip() if vol_m else ""
+        issue_m = re.search(r"<Issue>(.*?)</Issue>", xml)
+        issue = issue_m.group(1).strip() if issue_m else ""
         item = {
             "title":[title],
             "container-title":[journal],
@@ -332,37 +353,41 @@ def pubmed_fetch(pmid: str) -> Tuple[Optional[Dict[str,Any]], Optional[str]]:
     except Exception:
         return None, None
 
-# ----------------------------
-# Semantic Scholar fallback
-# ----------------------------
-def semantic_scholar_search(ref_text: str) -> Tuple[Optional[Dict[str,Any]], Optional[str]]:
+def semantic_scholar_search(title: str) -> Tuple[Optional[Dict[str,Any]], Optional[str]]:
     try:
-        q = ref_text[:300]
+        if not title:
+            return None, None
         url = "https://api.semanticscholar.org/graph/v1/paper/search"
-        params = {"query": q, "limit": 1, "fields": "title,authors,year,externalIds,venue"}
+        params = {"query": title[:300], "limit": 3, "fields": "title,authors,year,externalIds,venue"}
         r = requests.get(url, params=params, timeout=12)
         r.raise_for_status()
-        data = r.json()
-        papers = data.get("data", [])
-        if not papers:
+        data = r.json().get("data", [])
+        if not data:
             return None, None
-        p = papers[0]
-        ext = p.get("externalIds") or {}
-        doi = ext.get("DOI") or ext.get("DOI:")
-        item = {
-            "title":[p.get("title","")],
-            "author":[{"family": a.get("name","").split()[-1], "given": " ".join(a.get("name","").split()[:-1])} for a in p.get("authors",[])],
-            "issued":{"date-parts":[[p.get("year") or 0]]},
-            "container-title":[p.get("venue","")],
-            "DOI": doi or ""
-        }
-        return item, doi or None
+        best = None; best_score = 0.0
+        for p in data:
+            t = p.get("title","")
+            s = sim(title, t)
+            if s > best_score:
+                best_score = s; best = p
+        if best:
+            ext = best.get("externalIds") or {}
+            doi = ext.get("DOI") or ext.get("DOI:")
+            item = {
+                "title":[best.get("title","")],
+                "author":[{"family": a.get("name","").split()[-1], "given": " ".join(a.get("name","").split()[:-1])} for a in best.get("authors",[])],
+                "issued":{"date-parts":[[best.get("year") or 0]]},
+                "container-title":[best.get("venue","")],
+                "DOI": doi or ""
+            }
+            return item, doi or None
     except Exception:
         return None, None
+    return None, None
 
-# ----------------------------
-# Converters: RIS / BibTeX / CSV row builder
-# ----------------------------
+# -----------------------
+# Converters
+# -----------------------
 def convert_item_to_ris(item: Dict[str, Any]) -> str:
     if not item:
         return ""
@@ -370,18 +395,19 @@ def convert_item_to_ris(item: Dict[str, Any]) -> str:
     typemap = {"journal-article":"JOUR", "book":"BOOK", "book-chapter":"CHAP"}
     ty = typemap.get(item.get("type",""), "GEN")
     lines.append(f"TY  - {ty}")
-    if item.get("title"):
-        lines.append(f"TI  - {item['title'][0] if isinstance(item['title'], list) else item['title']}")
+    # title may be list or string
+    title = item.get("title",[item.get("title","")])[0] if isinstance(item.get("title"), list) else item.get("title","")
+    if title:
+        lines.append(f"TI  - {title}")
     for a in item.get("author", [])[:50]:
         if isinstance(a, dict):
-            fam = a.get("family","") or ""
-            giv = a.get("given","") or ""
-            lines.append(f"AU  - {fam}, {giv}")
+            lines.append(f"AU  - {a.get('family','')}, {a.get('given','')}")
         else:
             lines.append(f"AU  - {a}")
     if item.get("container-title"):
         ct = item['container-title'][0] if isinstance(item['container-title'], list) else item['container-title']
-        lines.append(f"JO  - {ct}")
+        if ct:
+            lines.append(f"JO  - {ct}")
     if item.get("volume"):
         lines.append(f"VL  - {item.get('volume')}")
     if item.get("issue"):
@@ -389,7 +415,7 @@ def convert_item_to_ris(item: Dict[str, Any]) -> str:
     if item.get("page"):
         p = item["page"]
         if "-" in p:
-            sp, ep = p.split("-", 1)
+            sp, ep = p.split("-",1)
             lines.append(f"SP  - {sp}")
             lines.append(f"EP  - {ep}")
         else:
@@ -404,18 +430,17 @@ def convert_item_to_ris(item: Dict[str, Any]) -> str:
 def convert_item_to_bibtex(item: Dict[str, Any]) -> str:
     if not item:
         return ""
-    first_author = (item.get("author") or [{}])[0]
-    fam = first_author.get("family","") if isinstance(first_author, dict) else str(first_author)
+    first = (item.get("author") or [{}])[0]
+    fam = first.get("family","") if isinstance(first, dict) else str(first)
     year = ""
     if item.get("issued",{}).get("date-parts"):
         year = str(item["issued"]["date-parts"][0][0])
     key = re.sub(r"\W+","", fam + year) or "ref"
-    btype = "article"
-    authors = " and ".join([ (f"{a.get('family','')}, {a.get('given','')}" if isinstance(a, dict) else str(a)) for a in (item.get("author") or []) ])
-    title = item.get("title", [""])[0] if item.get("title") else ""
-    journal = item.get("container-title", [""])[0] if item.get("container-title") else ""
+    authors = " and ".join([(f"{a.get('family','')}, {a.get('given','')}" if isinstance(a, dict) else str(a)) for a in (item.get("author") or [])])
+    title = item.get("title",[item.get("title","")])[0] if item.get("title") else ""
+    journal = item.get("container-title",[item.get("container-title","")])[0] if item.get("container-title") else ""
     doi = item.get("DOI","")
-    bib = f"@{btype}{{{key},\n"
+    bib = f"@article{{{key},\n"
     if authors: bib += f"  author = {{{authors}}},\n"
     if title: bib += f"  title = {{{title}}},\n"
     if journal: bib += f"  journal = {{{journal}}},\n"
@@ -425,21 +450,21 @@ def convert_item_to_bibtex(item: Dict[str, Any]) -> str:
     return bib
 
 def parsed_to_item_like(parsed: Dict[str, Any]) -> Dict[str, Any]:
-    # create item-like dict for converter uniformity
+    # Convert parsed dict (authors list, title,... ) into Crossref-like item
     item = {
         "title": [parsed.get("title","")],
         "author": [],
-        "container-title": [parsed.get("journal","")],
-        "issued": {"date-parts": [[int(parsed["year"])]]} if parsed.get("year") and str(parsed.get("year")).isdigit() else {"date-parts": [[0]]},
+        "container-title":[parsed.get("journal","")],
+        "issued": {"date-parts":[[int(parsed["year"])]]} if parsed.get("year") and str(parsed.get("year")).isdigit() else {"date-parts":[[0]]},
         "volume": parsed.get("volume",""),
         "issue": parsed.get("issue",""),
         "page": parsed.get("pages",""),
         "DOI": parsed.get("doi","")
     }
     for a in parsed.get("authors", [])[:50]:
-        # split author into family/given heuristically
+        # heuristics: "Family, Given" or "Family GivenInitials" or "Given Family"
         if "," in a:
-            fam,giv = [p.strip() for p in a.split(",",1)]
+            fam, giv = [p.strip() for p in a.split(",",1)]
         else:
             toks = a.split()
             if len(toks) == 1:
@@ -449,13 +474,9 @@ def parsed_to_item_like(parsed: Dict[str, Any]) -> Dict[str, Any]:
         item["author"].append({"family": fam, "given": giv})
     return item
 
-def parsed_to_ris(parsed: Dict[str, Any]) -> str:
-    item = parsed_to_item_like(parsed)
-    return convert_item_to_ris(item)
-
-# ----------------------------
+# -----------------------
 # Deduplication key
-# ----------------------------
+# -----------------------
 def canonicalize_for_dedupe(item: Optional[Dict[str,Any]], ref_text: str) -> str:
     if item and item.get("DOI"):
         return item["DOI"].lower()
@@ -464,50 +485,59 @@ def canonicalize_for_dedupe(item: Optional[Dict[str,Any]], ref_text: str) -> str
     s = re.sub(r"\s+", " ", s).strip()
     return hashlib.sha1(s.encode("utf-8")).hexdigest()
 
-# ----------------------------
+# -----------------------
 # Streamlit UI
-# ----------------------------
-st.set_page_config(page_title="Reference → RIS (Final)", layout="wide")
-st.title("📚 Reference → DOI → RIS — Final (Crossref + PubMed + Semantic Scholar + Hybrid AI Parser)")
+# -----------------------
+st.set_page_config(page_title="Reference → RIS (OpenAI parser)", layout="wide")
+st.title("📚 Reference → DOI → RIS (OpenAI-assisted parsing + Crossref/PubMed/SemanticScholar)")
 
 st.markdown("""
-Paste references (or upload PDFs). For each reference the app will:
-1. Try Crossref → PubMed (full, then title) → Semantic Scholar.
-2. Cross-check found metadata with your pasted reference (similarity).
-   - If similarity >= threshold → found metadata will be preselected.
-   - If similarity < threshold → the app will default to converting your pasted reference to RIS (you may still override).
-3. You can edit results and export RIS / BibTeX / CSV.
+**Workflow**
+1. Detect reference style.
+2. Search by **title** (Crossref → PubMed → Semantic Scholar).
+3. If a search result is found, **cross-check** result vs pasted reference (authors & year & journal).
+   - If match (above threshold) → use DOI & metadata.
+   - If mismatch → use OpenAI-parsed metadata from the pasted reference and convert that to RIS.
+4. Let user review/edit per reference. Export RIS/BibTeX/CSV.
 """)
 
-# Input mode
+# Inputs
 mode = st.radio("Input method", ["Paste references", "Upload PDF(s)"], horizontal=True)
 
 raw_text = ""
 if mode == "Paste references":
     raw_text = st.text_area("Paste references here (supports numbered forms like [1], 1., 1) etc.)", height=350)
 else:
-    uploaded = st.file_uploader("Upload PDF file(s)", type=["pdf"], accept_multiple_files=True)
+    uploaded = st.file_uploader("Upload PDF(s)", type=["pdf"], accept_multiple_files=True)
     if uploaded:
         parts = []
         for f in uploaded:
             with st.spinner(f"Extracting {f.name}..."):
-                txt = extract_text_from_pdf_file(f)
+                txt = extract_text_from_pdf(f)
                 if txt.startswith("ERROR_PDF_EXTRACT"):
                     st.error(f"Error extracting {f.name}: {txt}")
                 else:
-                    # try to locate References section
                     m = re.search(r"(References|REFERENCES|Bibliography|BIBLIOGRAPHY)([\s\S]{50,200000})", txt)
                     block = m.group(2) if m else txt
                     parts.append(block)
         raw_text = "\n\n".join(parts)
         if raw_text:
-            st.text_area("Extracted text from PDF", raw_text, height=200)
+            st.text_area("Extracted text (from PDF)", raw_text, height=200)
 
-auto_accept = st.checkbox("Auto-accept search result when similarity >= threshold", value=True)
-threshold = st.slider("Auto-accept similarity threshold", min_value=0.0, max_value=1.0, value=0.65, step=0.01)
+style, style_conf = detect_reference_style(raw_text)
+st.metric("Detected reference style", style)
+st.metric("Style confidence", style_conf)
+
+auto_accept = st.checkbox("Auto-accept matched search metadata when similarity >= threshold", value=True)
+threshold = st.slider("Similarity threshold for auto-accept (0-1)", min_value=0.0, max_value=1.0, value=0.70, step=0.01)
 export_format = st.selectbox("Export format", ["RIS", "BibTeX", "CSV"], index=0)
 
-if st.button("Process & Generate"):
+if OPENAI_API_KEY:
+    st.info("OpenAI API key found in secrets — OpenAI parsing enabled.")
+else:
+    st.warning("No OpenAI API key found in streamlit secrets or environment. OpenAI parsing disabled; fallback local parser will be used if needed.")
+
+if st.button("Process references"):
     if not raw_text.strip():
         st.warning("Please paste references or upload PDFs first.")
         st.stop()
@@ -515,69 +545,113 @@ if st.button("Process & Generate"):
     with st.spinner("Splitting references..."):
         refs = split_references_smart(raw_text)
     if not refs:
-        st.warning("No references detected after splitting.")
+        st.warning("No references detected.")
         st.stop()
-    st.success(f"Detected {len(refs)} reference(s).")
+    st.success(f"Detected {len(refs)} references.")
 
-    # Search & parse
     results = []
     seen_keys = set()
     progress = st.progress(0)
     status = st.empty()
 
+    # Main processing loop
     for i, ref in enumerate(refs, start=1):
-        status.text(f"Searching reference {i}/{len(refs)}")
-        # initial search attempts
+        status.text(f"Processing {i}/{len(refs)}")
+        ref_clean = clean_and_join_broken_lines(ref)
+        parsed_by_openai = None
+        if OPENAI_API_KEY:
+            parsed_by_openai = openai_parse_reference(ref_clean)
+        if not parsed_by_openai:
+            parsed_by_openai = fallback_local_parse(ref_clean)
+
+        # Title-based search (Crossref -> PubMed -> Semantic Scholar)
+        title_for_search = parsed_by_openai.get("title") or ref_clean[:240]
         item = None; doi = None; source = None
 
         # Crossref
-        cr_item, cr_doi = crossref_search(ref)
+        cr_item, cr_doi = crossref_search_by_title(title_for_search)
         if cr_item and cr_doi:
-            item, doi = cr_item, cr_doi
-            source = "Crossref"
-
-        # PubMed (full then title)
-        if not doi:
-            pm_item, pm_doi = pubmed_search_full(ref)
+            item, doi, source = cr_item, cr_doi, "Crossref"
+        else:
+            # PubMed
+            pm_item, pm_doi = pubmed_search_by_title(title_for_search)
             if pm_item and pm_doi:
-                item, doi = pm_item, pm_doi
-                source = "PubMed (full)"
+                item, doi, source = pm_item, pm_doi, "PubMed"
             else:
-                parsed_guess = hybrid_parse_reference(ref)
-                title_guess = parsed_guess.get("title") or ""
-                if title_guess:
-                    pm2_item, pm2_doi = pubmed_search_title_only(title_guess)
-                    if pm2_item and pm2_doi:
-                        item, doi = pm2_item, pm2_doi
-                        source = "PubMed (title)"
+                # Semantic Scholar fallback
+                ss_item, ss_doi = semantic_scholar_search(title_for_search)
+                if ss_item:
+                    item, doi, source = ss_item, ss_doi, "SemanticScholar"
 
-        # Semantic Scholar fallback
-        if not doi:
-            ss_item, ss_doi = semantic_scholar_search(ref)
-            if ss_item:
-                item, doi = ss_item, ss_doi
-                source = "SemanticScholar"
+        # If item found, compute cross-check between item metadata and pasted reference (authors & year & journal)
+        use_search_metadata = False
+        match_score = 0.0
+        if item:
+            # extract found values
+            found_title = (item.get("title") or [item.get("title","")])[0] if isinstance(item.get("title"), list) else item.get("title","")
+            found_journal = ""
+            if item.get("container-title"):
+                found_journal = item.get("container-title")[0] if isinstance(item.get("container-title"), list) else item.get("container-title","")
+            found_year = ""
+            if item.get("issued", {}).get("date-parts"):
+                found_year = str(item["issued"]["date-parts"][0][0])
+            # authors list (family names)
+            found_authors = []
+            for a in item.get("author", [])[:10]:
+                if isinstance(a, dict):
+                    if a.get("family"):
+                        found_authors.append(a.get("family"))
+                    elif a.get("name"):
+                        found_authors.append(a.get("name").split()[-1])
+                else:
+                    found_authors.append(str(a).split()[-1])
+            # compute matching metrics with parsed_by_openai (pasted)
+            pasted_authors = parsed_by_openai.get("authors", []) or []
+            # compare author family names overlap
+            def fams_from_strings(auth_list):
+                fams = []
+                for s in auth_list:
+                    if "," in s:
+                        fam = s.split(",")[0].strip()
+                    else:
+                        toks = s.split()
+                        fam = toks[-1] if toks else ""
+                    if fam:
+                        fams.append(fam)
+                return fams
+            pasted_fams = fams_from_strings(pasted_authors)
+            # compute author overlap ratio
+            overlap = 0
+            if pasted_fams and found_authors:
+                for pf in pasted_fams:
+                    for ff in found_authors:
+                        if pf.lower() == ff.lower():
+                            overlap += 1
+                author_score = overlap / max(1, len(pasted_fams))
+            else:
+                author_score = 0.0
+            # year similarity
+            pasted_year = parsed_by_openai.get("year","") or ""
+            year_score = 1.0 if (pasted_year and found_year and pasted_year == found_year) else 0.0
+            # journal similarity
+            journal_score = sim(parsed_by_openai.get("journal","") or "", found_journal or "")
+            # composite match score (weights)
+            match_score = 0.5 * author_score + 0.3 * year_score + 0.2 * journal_score
+            use_search_metadata = match_score >= threshold and auto_accept
 
-        # compute similarity between pasted ref and found title
-        found_title = item.get("title",[None])[0] if item and item.get("title") else None
-        sim_score = similarity(ref, found_title) if found_title else 0.0
-
-        # hybrid parsed (always compute for fallback)
-        parsed = hybrid_parse_reference(ref)
-
-        # dedupe key
-        key = canonicalize_for_dedupe(item, ref)
+        # prepare result record
+        key = canonicalize_for_dedupe(item, ref_clean)
         duplicate = key in seen_keys
         if not duplicate:
             seen_keys.add(key)
-
         results.append({
             "original": ref,
-            "item": item,
-            "doi": doi,
-            "source": source,
-            "similarity": sim_score,
-            "parsed": parsed,
+            "parsed_openai": parsed_by_openai,
+            "found_item": item,
+            "found_doi": doi,
+            "found_source": source,
+            "match_score": match_score,
+            "use_search_metadata_default": use_search_metadata,
             "duplicate": duplicate
         })
         progress.progress(i/len(refs))
@@ -586,140 +660,125 @@ if st.button("Process & Generate"):
     status.empty()
     progress.empty()
 
-    # Interactive Review: default selection respects auto-cross-check rule
-    st.header("Review detected references")
-    st.write("If a search result was found but similarity < threshold, the app defaults to converting the pasted reference to RIS. You can still override and accept the search metadata for any reference.")
-
-    chosen = []  # list of dicts {include, use_search, final_item, final_parsed, source}
+    # Interactive review
+    st.header("Review & decide per reference")
+    choices = []
     for idx, r in enumerate(results, start=1):
-        with st.expander(f"Reference {idx}: {r['original'][:200]}{'...' if len(r['original'])>200 else ''}"):
+        with st.expander(f"Ref {idx}: {r['original'][:200]}{'...' if len(r['original'])>200 else ''}"):
             if r["duplicate"]:
-                st.info("Duplicate detected — you may skip or still include.")
-            if r["item"]:
-                st.markdown(f"**Found ({r['source']}) — similarity {r['similarity']:.2f}**")
-                title_display = r["item"].get("title",[r['parsed'].get("title","")])[0] if r.get("item") else r['parsed'].get("title","")
-                st.write("Title (found):", title_display)
-                if r.get("doi"):
-                    st.write("DOI:", r["doi"])
-                # show authors preview
-                if r["item"] and r["item"].get("author"):
-                    auths = r["item"].get("author")
+                st.info("Duplicate detected.")
+            # show found metadata if any
+            if r["found_item"]:
+                st.markdown(f"**Search result found ({r['found_source']}) — default match score: {r['match_score']:.2f}**")
+                ft = (r["found_item"].get("title") or [""])[0] if isinstance(r["found_item"].get("title"), list) else r["found_item"].get("title","")
+                st.write("Found title:", ft)
+                if r["found_doi"]:
+                    st.write("Found DOI:", r["found_doi"])
+                if r["found_item"].get("container-title"):
+                    st.write("Found journal:", r["found_item"].get("container-title")[0] if isinstance(r["found_item"].get("container-title"), list) else r["found_item"].get("container-title",""))
+                # authors preview
+                if r["found_item"].get("author"):
                     preview = []
-                    for a in auths[:6]:
+                    for a in (r["found_item"].get("author") or [])[:6]:
                         if isinstance(a, dict):
                             preview.append(f"{a.get('family','')} {a.get('given','')}")
                         else:
                             preview.append(str(a))
-                    st.write("Authors (preview):", ", ".join(preview))
+                    st.write("Found authors (preview):", ", ".join(preview))
             else:
                 st.warning("No search metadata found.")
 
-            # Show parsed preview always
-            st.markdown("**Hybrid-parsed (auto)**")
-            parsed = r.get("parsed", {})
-            st.write(f"Authors: {parsed.get('authors')}")
-            st.write(f"Title: {parsed.get('title')}")
-            st.write(f"Journal: {parsed.get('journal')}")
-            st.write(f"Year: {parsed.get('year')}")
-            st.write(f"Volume/Issue/Pages: {parsed.get('volume')}/{parsed.get('issue')}/{parsed.get('pages')}")
-            if parsed.get("doi"):
-                st.write("DOI (in text):", parsed.get("doi"))
+            # show OpenAI parsed metadata
+            st.markdown("**OpenAI parsed (from pasted text)**")
+            p = r["parsed_openai"]
+            st.write("Authors:", p.get("authors"))
+            st.write("Title:", p.get("title"))
+            st.write("Journal:", p.get("journal"))
+            st.write("Year:", p.get("year"))
+            st.write("Volume/Issue/Pages:", f"{p.get('volume')}/{p.get('issue')}/{p.get('pages')}")
+            if p.get("doi"):
+                st.write("DOI (in pasted text):", p.get("doi"))
 
-            # Default selection logic:
-            # - If item found AND similarity >= threshold => default use_search True
-            # - If item found AND similarity < threshold => default use_search False (auto-convert raw)
-            default_use_search = False
-            if r["item"] and auto_accept and r["similarity"] >= threshold:
-                default_use_search = True
-            elif r["item"] and r["similarity"] < threshold:
-                default_use_search = False
+            # default selection
+            default_index = 0 if r["use_search_metadata_default"] else 1
+            action = st.radio(f"Choose action for ref {idx}", ("Use search metadata (and DOI)","Use pasted reference → Use OpenAI parsed metadata"), index=default_index, key=f"action_{idx}")
+            include = st.checkbox(f"Include this reference in export", value=True, key=f"include_{idx}")
 
-            choice = st.radio(
-                f"Choose action for ref {idx}",
-                options=["Use found metadata (if any)", "Use pasted reference → Hybrid parser → RIS"],
-                index=0 if default_use_search else 1,
-                key=f"choice_{idx}"
-            )
-            include = st.checkbox(f"Include this reference in export (Ref {idx})", value=True, key=f"include_{idx}")
-
-            chosen.append({
+            choices.append({
                 "include": include,
-                "use_search": (choice == "Use found metadata (if any)"),
-                "result": r
+                "use_search": action == "Use search metadata (and DOI)",
+                "record": r
             })
 
-    # Build final outputs according to choices
+    # Build outputs
     ris_blocks = []
     bib_blocks = []
     csv_rows = []
-    for ent in chosen:
-        if not ent["include"]:
+    for c in choices:
+        if not c["include"]:
             continue
-        r = ent["result"]
-        if ent["use_search"] and r["item"]:
-            # Validate cross-check again: if similarity < threshold, app auto-converted earlier by default.
-            # But if user explicitly chose use_search, we accept it.
-            ris_blocks.append(convert_item_to_ris(r["item"]))
-            bib_blocks.append(convert_item_to_bibtex(r["item"]))
-            # CSV row
+        r = c["record"]
+        if c["use_search"] and r["found_item"]:
+            # use found_item
+            ris_blocks.append(convert_item_to_ris(r["found_item"]))
+            bib_blocks.append(convert_item_to_bibtex(r["found_item"]))
             csv_rows.append({
                 "original": r["original"],
-                "title": r["item"].get("title",[r["parsed"].get("title","")])[0] if r["item"].get("title") else r["parsed"].get("title",""),
-                "doi": r.get("doi") or "",
-                "journal": (r["item"].get("container-title",[r["parsed"].get("journal","")])[0] if r["item"].get("container-title") else r["parsed"].get("journal","")),
-                "year": r["item"].get("issued",{}).get("date-parts",[[r["parsed"].get("year","")]])[0][0] if r["item"].get("issued") else r["parsed"].get("year",""),
-                "source": r.get("source") or "parsed"
+                "title": (r["found_item"].get("title") or [""])[0] if isinstance(r["found_item"].get("title"), list) else r["found_item"].get("title",""),
+                "doi": r.get("found_doi") or "",
+                "journal": r["found_item"].get("container-title",[r["parsed_openai"].get("journal","")])[0] if r["found_item"].get("container-title") else r["parsed_openai"].get("journal",""),
+                "year": r["found_item"].get("issued",{}).get("date-parts",[[r["parsed_openai"].get("year","")]])[0][0] if r["found_item"].get("issued") else r["parsed_openai"].get("year",""),
+                "source": r.get("found_source") or "search"
             })
         else:
-            # Use hybrid parsed to produce RIS
-            parsed = r["parsed"]
-            ris_blocks.append(parsed_to_ris(parsed))
-            # Build item-like for bib conversion
+            # use parsed_openai
+            parsed = r["parsed_openai"]
             item_like = parsed_to_item_like(parsed)
+            ris_blocks.append(convert_item_to_ris(item_like))
             bib_blocks.append(convert_item_to_bibtex(item_like))
             csv_rows.append({
                 "original": r["original"],
                 "title": parsed.get("title",""),
-                "doi": parsed.get("doi","") or "",
+                "doi": parsed.get("doi",""),
                 "journal": parsed.get("journal",""),
                 "year": parsed.get("year",""),
                 "source": "parsed"
             })
 
-    # Final export UI
-    st.header("Export")
-    total_entries = len(ris_blocks)
-    st.success(f"Prepared {total_entries} entries for export.")
+    # Export UI
+    st.header("Export Results")
+    cnt = len(ris_blocks)
+    st.success(f"Prepared {cnt} entries for export.")
 
     if export_format == "RIS":
-        final_ris = "".join(ris_blocks)
-        if not final_ris.strip():
-            st.error("No RIS output generated.")
-        else:
-            st.download_button("Download RIS file", data=final_ris, file_name="references.ris", mime="application/x-research-info-systems")
+        final = "".join(ris_blocks)
+        if final.strip():
+            st.download_button("Download RIS", data=final, file_name="references.ris", mime="application/x-research-info-systems")
             with st.expander("RIS preview"):
-                st.code(final_ris, language="text")
+                st.code(final, language="text")
+        else:
+            st.error("No RIS generated.")
     elif export_format == "BibTeX":
-        final_bib = "".join(bib_blocks)
-        if not final_bib.strip():
-            st.error("No BibTeX output generated.")
-        else:
-            st.download_button("Download BibTeX file", data=final_bib, file_name="references.bib", mime="text/x-bibtex")
+        final = "".join(bib_blocks)
+        if final.strip():
+            st.download_button("Download BibTeX", data=final, file_name="references.bib", mime="text/x-bibtex")
             with st.expander("BibTeX preview"):
-                st.code(final_bib, language="text")
-    else:  # CSV
-        # produce CSV from csv_rows
-        if not csv_rows:
-            st.error("No CSV data generated.")
+                st.code(final, language="text")
         else:
-            csv_buf = io.StringIO()
-            writer = csv.DictWriter(csv_buf, fieldnames=["original","title","doi","journal","year","source"])
+            st.error("No BibTeX generated.")
+    else:
+        # CSV
+        if not csv_rows:
+            st.error("No CSV data.")
+        else:
+            buf = io.StringIO()
+            writer = csv.DictWriter(buf, fieldnames=["original","title","doi","journal","year","source"])
             writer.writeheader()
-            for row in csv_rows:
-                writer.writerow(row)
-            csv_data = csv_buf.getvalue()
+            for r in csv_rows:
+                writer.writerow(r)
+            csv_data = buf.getvalue()
             st.download_button("Download CSV", data=csv_data, file_name="references.csv", mime="text/csv")
             with st.expander("CSV preview"):
                 st.code(csv_data, language="text")
 
-st.caption("Search order: Crossref → PubMed (full then title) → Semantic Scholar. If search result similarity < threshold, default is to convert pasted reference to RIS. You can override per-reference.")
+st.caption("Note: OpenAI parsing uses the key stored in Streamlit secrets under OPENAI_API_KEY. If you want improved parsing accuracy, add a robust model key. Cross-check uses authors+year+journal (weighted) and the threshold slider controls auto-accept behavior.")
