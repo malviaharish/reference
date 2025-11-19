@@ -420,4 +420,264 @@ def parsed_raw_to_ris(parsed: Dict[str, Any]) -> str:
     for a in parsed.get("authors", [])[:50]:
         lines.append(f"AU  - {a}")
     if parsed.get("journal"):
-        lines.append(f"JO
+        lines.append(f"JO  - {parsed['journal']}")
+    if parsed.get("volume"):
+        lines.append(f"VL  - {parsed['volume']}")
+    if parsed.get("issue"):
+        lines.append(f"IS  - {parsed['issue']}")
+    if parsed.get("pages"):
+        pg = parsed.get("pages")
+        if "-" in pg:
+            sp, ep = pg.split("-",1)
+            lines.append(f"SP  - {sp}")
+            lines.append(f"EP  - {ep}")
+        else:
+            lines.append(f"SP  - {pg}")
+    if parsed.get("year"):
+        lines.append(f"PY  - {parsed['year']}")
+    if parsed.get("doi"):
+        lines.append(f"DO  - {parsed['doi']}")
+    lines.append("ER  - ")
+    return "\n".join(lines) + "\n\n"
+
+# -------------------------
+# Deduplication key
+# -------------------------
+def canonicalize_for_dedupe(item: Optional[Dict[str,Any]], ref_text: str) -> str:
+    if item and item.get("DOI"):
+        return item["DOI"].lower()
+    s = re.sub(r"\W+", " ", ref_text.lower())
+    s = re.sub(r"\b(19|20)\d{2}\b", "", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return hashlib.sha1(s.encode("utf-8")).hexdigest()
+
+# -------------------------
+# Streamlit UI
+# -------------------------
+st.set_page_config(page_title="Reference → RIS (Hybrid Parser)", layout="wide")
+st.title("📚 Reference → DOI → RIS (Crossref + PubMed + Semantic Scholar + Hybrid AI Parser)")
+st.write("Paste references or upload PDF. The app searches metadata and — when you choose — uses a Hybrid AI Parser to extract fields and create RIS entries.")
+
+mode = st.radio("Input method", ["Paste references", "Upload PDF"], horizontal=True)
+
+raw_text = ""
+if mode == "Paste references":
+    raw_text = st.text_area("Paste references here (supports [1], 1., 1) etc.)", height=300)
+else:
+    uploaded = st.file_uploader("Upload PDF file(s)", type=["pdf"], accept_multiple_files=True)
+    if uploaded:
+        parts = []
+        for f in uploaded:
+            with st.spinner(f"Extracting {f.name}..."):
+                txt = extract_text_from_pdf_file(f)
+                if txt.startswith("ERROR_PDF_EXTRACT"):
+                    st.error(f"Error extracting {f.name}: {txt}")
+                else:
+                    m = re.search(r"(References|REFERENCES|Bibliography|BIBLIOGRAPHY)([\s\S]{50,200000})", txt)
+                    block = m.group(2) if m else txt
+                    parts.append(block)
+        raw_text = "\n\n".join(parts)
+        if raw_text:
+            st.text_area("Extracted text", raw_text, height=200)
+
+auto_accept = st.checkbox("Auto-accept search results when similarity >= threshold", value=True)
+threshold = st.slider("Auto-accept similarity threshold", min_value=0.0, max_value=1.0, value=0.65, step=0.05)
+export_format = st.selectbox("Export format", ["RIS", "BibTeX"], index=0)
+
+if st.button("Process references"):
+    if not raw_text.strip():
+        st.warning("Paste references or upload a PDF first.")
+        st.stop()
+
+    with st.spinner("Splitting references..."):
+        refs = split_references_smart(raw_text)
+    if not refs:
+        st.warning("No references detected.")
+        st.stop()
+
+    st.success(f"Detected {len(refs)} references.")
+    st.info("Searching Crossref → PubMed (full ref then title) → Semantic Scholar. If you prefer, use Hybrid Parser to convert raw reference to RIS.")
+
+    all_results = []
+    seen_keys = set()
+    ris_blocks = []
+    bib_blocks = []
+
+    progress = st.progress(0)
+    status = st.empty()
+
+    # Search & parse loop
+    for i, ref in enumerate(refs, start=1):
+        status.text(f"Processing reference {i}/{len(refs)}")
+        item = None
+        doi = None
+        source = None
+
+        # Crossref
+        cr_item, cr_doi = crossref_search(ref)
+        if cr_item and cr_doi:
+            item, doi = cr_item, cr_doi
+            source = "Crossref"
+        else:
+            # PubMed full text
+            pm_item, pm_doi = pubmed_search_full(ref)
+            if pm_item and pm_doi:
+                item, doi = pm_item, pm_doi
+                source = "PubMed (full)"
+            else:
+                # PubMed title only (use parsed title)
+                parsed = hybrid_parse_reference(ref)
+                title_guess = parsed.get("title") or ""
+                if title_guess:
+                    pm2_item, pm2_doi = pubmed_search_title_only(title_guess)
+                    if pm2_item and pm2_doi:
+                        item, doi = pm2_item, pm2_doi
+                        source = "PubMed (title)"
+                # Semantic Scholar fallback
+                if not doi:
+                    ss_item, ss_doi = semantic_scholar_search(ref)
+                    if ss_item:
+                        item, doi = ss_item, ss_doi
+                        source = "SemanticScholar"
+
+        found_title = item.get("title",[None])[0] if item else None
+        sim_score = similarity(ref, found_title) if found_title else 0.0
+
+        key = canonicalize_for_dedupe(item, ref)
+        duplicate = key in seen_keys
+        if not duplicate:
+            seen_keys.add(key)
+
+        all_results.append({
+            "original": ref,
+            "item": item,
+            "doi": doi,
+            "source": source,
+            "sim": sim_score,
+            "duplicate": duplicate,
+            "parsed": hybrid_parse_reference(ref)  # precompute hybrid parse for quick choice
+        })
+        progress.progress(i/len(refs))
+        time.sleep(0.12)
+
+    status.empty()
+    progress.empty()
+
+    # Interactive review
+    st.header("Review & choose per reference")
+    user_choices = []
+    for idx, r in enumerate(all_results, start=1):
+        with st.expander(f"Reference {idx} — {r['original'][:200]}{'...' if len(r['original'])>200 else ''}"):
+            if r["duplicate"]:
+                st.info("Duplicate detected — you may skip or still include.")
+            if r["item"]:
+                st.markdown(f"**Found ({r['source']}) — similarity {r['sim']:.2f}**")
+                st.write("Title:", r["item"].get("title", [""])[0] if r["item"].get("title") else "")
+                if r.get("doi"):
+                    st.write("DOI:", r["doi"])
+                if r["item"].get("author"):
+                    names_preview = ", ".join([f"{a.get('family','')} {a.get('given','')}".strip() for a in r["item"].get("author",[])][:6])
+                    if names_preview:
+                        st.write("Authors (preview):", names_preview)
+            else:
+                st.warning("No search metadata found.")
+
+            # Show hybrid parsed preview
+            parsed = r.get("parsed", {})
+            st.markdown("**Hybrid parser preview (auto)**")
+            st.write(f"Authors: {parsed.get('authors')}")
+            st.write(f"Title: {parsed.get('title')}")
+            st.write(f"Journal: {parsed.get('journal')}")
+            st.write(f"Year: {parsed.get('year')}")
+            st.write(f"Volume/Issue/Pages: {parsed.get('volume')}/{parsed.get('issue')}/{parsed.get('pages')}")
+            if parsed.get("doi"):
+                st.write("DOI (found in text):", parsed.get("doi"))
+
+            default_choice = 1  # 0 -> use search, 1 -> use hybrid raw
+            if r["item"] and auto_accept and r["sim"] >= threshold:
+                default_choice = 0
+
+            choice = st.radio(
+                f"Action for reference {idx}",
+                ("Use found metadata (if any)", "Use Hybrid parser → convert raw reference to RIS"),
+                index=default_choice,
+                key=f"choice_{idx}"
+            )
+            include_checkbox = st.checkbox(f"Include this reference in export (Ref {idx})", value=True, key=f"include_{idx}")
+
+            user_choices.append({
+                "include": include_checkbox,
+                "choice": choice,
+                "result": r
+            })
+
+    # Build outputs
+    for entry in user_choices:
+        if not entry["include"]:
+            continue
+        r = entry["result"]
+        if entry["choice"] == "Use found metadata (if any)" and r["item"]:
+            # use search item
+            if export_format == "RIS":
+                ris_blocks.append(convert_item_to_ris(r["item"]))
+            else:
+                bib_blocks.append(convert_item_to_bibtex(r["item"]))
+        else:
+            # use hybrid parsed version
+            parsed = r.get("parsed", {})
+            # Build a crossref-like item for uniform conversion
+            item_like = {
+                "title": [parsed.get("title","")],
+                "author": [],
+                "container-title": [parsed.get("journal","")],
+                "issued": {"date-parts": [[int(parsed.get("year"))]]} if parsed.get("year") and str(parsed.get("year")).isdigit() else {"date-parts": [[0]]},
+                "volume": parsed.get("volume",""),
+                "issue": parsed.get("issue",""),
+                "page": parsed.get("pages",""),
+                "DOI": parsed.get("doi","") or ""
+            }
+            # authors as "family, given" are not parsed perfectly; keep raw strings
+            # convert parsed authors into simple author dicts if possible
+            authors = []
+            for a in parsed.get("authors", [])[:50]:
+                # If "Surname Initials" or "Surname, Given" style detection
+                if "," in a:
+                    parts = [p.strip() for p in a.split(",",1)]
+                    family = parts[0]
+                    given = parts[1] if len(parts) > 1 else ""
+                else:
+                    # split last token as family
+                    toks = a.split()
+                    if len(toks) == 1:
+                        family = toks[0]; given = ""
+                    else:
+                        family = toks[-1]; given = " ".join(toks[:-1])
+                authors.append({"family": family, "given": given})
+            item_like["author"] = authors
+
+            if export_format == "RIS":
+                ris_blocks.append(convert_item_to_ris(item_like))
+            else:
+                bib_blocks.append(convert_item_to_bibtex(item_like))
+
+    # Finalize outputs and downloads
+    total_included = sum(1 for e in user_choices if e["include"])
+    st.success(f"Prepared export with {total_included} references.")
+
+    if export_format == "RIS":
+        final_ris = "".join(ris_blocks)
+        if not final_ris.strip():
+            st.error("No RIS content generated.")
+        else:
+            st.download_button("Download RIS", data=final_ris, file_name="references.ris", mime="application/x-research-info-systems")
+            with st.expander("RIS preview"):
+                st.code(final_ris, language="text")
+    else:
+        final_bib = "".join(bib_blocks)
+        if not final_bib.strip():
+            st.warning("No BibTeX content generated.")
+        st.download_button("Download BibTeX", data=final_bib, file_name="references.bib", mime="text/x-bibtex")
+        with st.expander("BibTeX preview"):
+            st.code(final_bib, language="text")
+
+st.caption("Search order: Crossref → PubMed (full ref then title) → Semantic Scholar. Hybrid parser = Mode B (heuristics + pattern detection). Adjust auto-accept threshold to speed decisions.")
