@@ -10,6 +10,8 @@ import requests
 import streamlit as st
 from pypdf import PdfReader
 
+import streamlit as st
+from scholarly import scholarly
 # ----------------------------
 # Helpers: PDF extraction
 # ----------------------------
@@ -219,43 +221,34 @@ def search_pubmed(ref_text: str) -> Tuple[Optional[Dict[str, Any]], Optional[str
     except Exception:
         return None, None
 
-# ----------------------------
-# Google Scholar via SerpAPI (optional)
-# ----------------------------
-def search_google_scholar(ref_text: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    """
-    If you have SERPAPI_KEY in Streamlit secrets, this will use SerpAPI's Google Scholar engine.
-    Otherwise it returns (None, None).
-    """
-    key = st.secrets.get("SERPAPI_KEY") if "SERPAPI_KEY" in st.secrets else None
-    if not key:
-        return None, None
+def search_google_scholar(query):
     try:
-        q = urllib.parse.quote_plus(ref_text)
-        url = f"https://serpapi.com/search.json?q={q}&engine=google_scholar&api_key={key}"
-        r = requests.get(url, timeout=12)
-        r.raise_for_status()
-        data = r.json()
-        org = data.get("organic_results", [])
-        if not org:
-            return None, None
-        top = org[0]
-        snippet = top.get("snippet", "")
-        doi_m = DOI_RE.search(snippet)
-        doi = doi_m.group(0) if doi_m else ""
-        title = top.get("title", "")
-        publication = top.get("publication", "")
-        year = top.get("year") or 0
-        item = {
-            "title":[title],
-            "container-title":[publication],
-            "DOI": doi,
-            "issued": {"date-parts": [[int(year) if year else 0]]},
-            "author": []
-        }
-        return item, doi
-    except Exception:
-        return None, None
+        search_query = scholarly.search_pubs(query)
+        first_result = next(search_query, None)
+
+        if first_result:
+            pub = scholarly.fill(first_result)
+            return {
+                "title": pub.get("bib", {}).get("title", ""),
+                "authors": pub.get("bib", {}).get("author", ""),
+                "year": pub.get("bib", {}).get("pub_year", ""),
+                "doi": pub.get("pub_url", "")
+            }
+        else:
+            return None
+
+    except Exception as e:
+        return {"error": str(e)}
+
+st.title("Google Scholar Search (No API Needed)")
+query = st.text_input("Enter title or DOI")
+
+if st.button("Search"):
+    with st.spinner("Searching Google Scholar..."):
+        result = search_google_scholar(query)
+
+    st.write(result)
+
 
 # ----------------------------
 # Converters: RIS / BibTeX / EndNote / APA
@@ -550,3 +543,4 @@ if "last_results" in st.session_state:
                 st.code(final, language="text")
 
 st.caption("This app queries Crossref and PubMed. Google Scholar fallback via SerpAPI is optional. Add 'SERPAPI_KEY' in Streamlit secrets to enable Scholar search. For large batches consider adding a mailto param and/or longer delays.")
+
