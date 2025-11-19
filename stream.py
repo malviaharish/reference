@@ -1,621 +1,552 @@
+# streamlit_ref_tool.py
 import re
+import time
+import json
+import hashlib
+import urllib.parse
+from typing import List, Tuple, Optional, Dict, Any
+
 import requests
 import streamlit as st
 from pypdf import PdfReader
-import io
 
-
-def extract_text_from_pdf(pdf_file):
-    """
-    Extracts text from an uploaded PDF file.
-    Returns the full text content as a string.
-    """
+# ----------------------------
+# Helpers: PDF extraction
+# ----------------------------
+def extract_text_from_pdf(uploaded_file) -> str:
+    """Extract text from an uploaded PDF (file-like)."""
     try:
-        pdf_reader = PdfReader(pdf_file)
-        text = ""
-        for page in pdf_reader.pages:
-            text += page.extract_text() + "\n"
-        return text
+        reader = PdfReader(uploaded_file)
+        parts = []
+        for p in reader.pages:
+            t = p.extract_text()
+            if t:
+                parts.append(t)
+        return "\n".join(parts)
     except Exception as e:
-        return f"Error extracting text from PDF: {str(e)}"
+        return f"ERROR: {e}"
 
-
-def detect_reference_style(text):
+# ----------------------------
+# Helpers: cleaning & splitting
+# ----------------------------
+def clean_and_join_broken_lines(text: str) -> str:
     """
-    Attempts to detect the citation style used in the references.
-    Returns a tuple of (detected_style, confidence_level)
+    Fix common PDF line-break artifacts:
+    - Join hyphenated words at EOL
+    - Merge lines with mid-sentence breaks
     """
-    patterns = {
-        'APA': {
-            'author_year': r'\b[A-Z][a-z]+,\s+[A-Z]\.\s*(?:&|and)\s+[A-Z][a-z]+,\s+[A-Z]\.\s*\(\d{4}\)',
-            'journal_style': r'\.\s+[A-Z][^.]+\.\s+\d+\(\d+\)',
-        },
-        'MLA': {
-            'author_title': r'\b[A-Z][a-z]+,\s+[A-Z][a-z]+\.\s+"[^"]+\."',
-            'title_quotes': r'"[^"]+\."',
-        },
-        'Chicago': {
-            'footnote_style': r'\d+\.\s+[A-Z][a-z]+,\s+[A-Z][a-z]+',
-            'publisher': r':\s+[A-Z][^,]+,\s+\d{4}',
-        },
-        'IEEE': {
-            'bracket_number': r'\[\d+\]\s+[A-Z]',
-            'et_al': r'et\s+al\.',
-        }
-    }
-    
-    style_scores = {}
-    
-    for style, style_patterns in patterns.items():
-        score = 0
-        for pattern_name, pattern in style_patterns.items():
-            matches = re.findall(pattern, text)
-            score += len(matches)
-        style_scores[style] = score
-    
-    if max(style_scores.values()) == 0:
-        return "Unknown", "Low"
-    
-    detected_style = max(style_scores, key=style_scores.get)
-    max_score = style_scores[detected_style]
-    
-    if max_score >= 3:
-        confidence = "High"
-    elif max_score >= 1:
-        confidence = "Medium"
-    else:
-        confidence = "Low"
-    
-    return detected_style, confidence
+    if not text:
+        return ""
+    # Normalize line endings
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    # Remove hyphenation at line breaks: "adhe\n-sives" variants
+    text = re.sub(r"(\w+)-\n(\w+)", r"\1\2", text)
+    # Replace remaining single newlines between lowercase/uppercase with space
+    text = re.sub(r"(?<=[^\n])\n(?=[^\n])", " ", text)
+    # Collapse multiple spaces
+    text = re.sub(r"\s{2,}", " ", text)
+    return text.strip()
 
-
-def split_numbered_references(text):
+def split_references_smart(text: str) -> List[str]:
     """
-    Takes raw pasted reference text and splits it into complete reference blocks.
-    Works for formats like:
-    1. First line
-       continuation line...
-    2. Next reference...
+    Smart splitter for references:
+    - Works for numbered and unnumbered lists
+    - Joins wrapped lines
+    - Uses heuristics to detect new reference starts
     """
-    lines = text.splitlines()
-    refs = []
-    current = []
+    if not text:
+        return []
 
-    for line in lines:
-        if re.match(r"^\s*\d+[\.\)]\s*", line):
-            if current:
-                refs.append(" ".join(current).strip())
-                current = []
-            line = re.sub(r"^\s*\d+[\.\)]\s*", "", line).strip()
-            current.append(line)
-        else:
-            if line.strip():
-                current.append(line.strip())
+    # First clean line breaks/hyphenation
+    text = clean_and_join_broken_lines(text)
 
-    if current:
-        refs.append(" ".join(current).strip())
+    # If clear numeric markers exist (1. or [1] or 1) ), split by them
+    if re.search(r"(?:^|\n)\s*(?:\[\d+\]|\d+[\.\)])\s+", text):
+        parts = re.split(r"(?:\n\s*)?(?:\[\d+\]|\d+[\.\)])\s*", text)
+        parts = [p.strip() for p in parts if len(p.strip()) > 30]
+        if parts:
+            return parts
 
-    return refs
-
-
-def validate_reference(ref_text):
-    """
-    Validates a reference text for basic completeness.
-    Returns (is_valid, issues_list)
-    """
-    issues = []
-    
-    if len(ref_text) < 20:
-        issues.append("Reference seems too short")
-    
-    if not any(char.isdigit() for char in ref_text):
-        issues.append("No year/date detected")
-    
-    if ref_text.count(',') < 1:
-        issues.append("Missing commas (incomplete citation?)")
-    
-    return len(issues) == 0, issues
-
-
-def detect_duplicates(results):
-    """
-    Detects duplicate references based on DOI.
-    Returns dict mapping index to list of duplicate indices.
-    """
-    duplicates = {}
-    doi_to_indices = {}
-    
-    for idx, result in enumerate(results):
-        if result['found'] and result['doi']:
-            doi = result['doi']
-            if doi in doi_to_indices:
-                if doi not in duplicates:
-                    duplicates[doi] = [doi_to_indices[doi]]
-                duplicates[doi].append(idx)
+    # Heuristic split for non-numbered references:
+    # Split on period-space followed by Capitalized token that looks like an author surname or journal start
+    # But be conservative: only split when the left segment contains typical citation cues (year, journal abbreviations, volume:page)
+    cand = re.split(r"\.\s+(?=[A-Z])", text)
+    results = []
+    for c in cand:
+        c = c.strip()
+        if len(c) < 30:
+            # likely stray; append to previous if exists
+            if results:
+                results[-1] = results[-1] + " " + c
             else:
-                doi_to_indices[doi] = idx
-    
-    return duplicates
+                results.append(c)
+        else:
+            # ensure trailing period
+            if not c.endswith("."):
+                c = c + "."
+            results.append(c)
+    # Post-process: merge fragments that don't look like full references (no year/journal/pp)
+    final = []
+    for r in results:
+        if final and (len(r) < 60 and not re.search(r"\b(19|20)\d{2}\b", r)):
+            # short fragment without year -> append to previous
+            final[-1] = final[-1].rstrip(".") + " " + r
+        else:
+            final.append(r)
+    # Final cleanup
+    final = [re.sub(r"\s+", " ", f).strip() for f in final if f.strip()]
+    # If still one long block with many commas, attempt splitting by double spaces / semicolons
+    if len(final) == 1 and final[0].count(";") >= 3:
+        alt = [s.strip() for s in re.split(r";\s*", final[0]) if len(s.strip()) > 30]
+        if len(alt) > 1:
+            final = alt
+    return final
 
+# ----------------------------
+# Utilities: detection / validation
+# ----------------------------
+def detect_reference_style(text: str) -> Tuple[str, str]:
+    """Simple heuristic to detect style and confidence."""
+    text_lower = text.lower()
+    score = {"Vancouver": 0, "APA": 0, "MLA": 0, "Chicago": 0}
+    # Vancouver cues: year;volume:pages or year;vol
+    if re.search(r"\b(19|20)\d{2}\b", text):
+        score["Vancouver"] += len(re.findall(r"\b(19|20)\d{2}\b", text))
+    if re.search(r"\(\d{4}\)", text):
+        score["APA"] += len(re.findall(r"\(\d{4}\)", text))
+    if '"' in text:
+        score["MLA"] += text.count('"')
+    best = max(score, key=score.get)
+    conf = "Low"
+    if score[best] >= 4:
+        conf = "High"
+    elif score[best] >= 1:
+        conf = "Medium"
+    # If all zero -> Unknown
+    if all(v == 0 for v in score.values()):
+        return "Unknown", "Low"
+    return best, conf
 
-def search_crossref(ref_text):
-    url = "https://api.crossref.org/works"
-    params = {"query": ref_text, "rows": 1}
+def validate_reference(ref_text: str) -> Tuple[bool, List[str]]:
+    """Very lightweight validation for user feedback."""
+    issues = []
+    if len(ref_text) < 20:
+        issues.append("Reference seems very short")
+    if not re.search(r"\b(19|20)\d{2}\b", ref_text):
+        issues.append("No year found")
+    if "," not in ref_text and "." not in ref_text:
+        issues.append("No obvious separators found")
+    return (len(issues) == 0), issues
 
+# ----------------------------
+# Crossref lookup
+# ----------------------------
+DOI_RE = re.compile(r"10\.\d{4,9}/[-._;()/:A-Za-z0-9]+")
+
+def search_crossref(ref_text: str) -> Tuple[Optional[Dict[str,Any]], Optional[str]]:
+    """
+    Search Crossref: try DOI direct lookup; otherwise bibliographic query.
+    Returns (item, doi) or (None, None)
+    """
+    # Try detect DOI in the text
+    doi_match = DOI_RE.search(ref_text)
     try:
-        r = requests.get(url, params=params, timeout=10)
+        if doi_match:
+            doi = doi_match.group(0).rstrip(".,;")
+            url = f"https://api.crossref.org/works/{doi}"
+            r = requests.get(url, timeout=12)
+            if r.status_code == 200:
+                data = r.json().get("message", {})
+                return data, doi
+        # else use bibliographic search (use a short title guess)
+        # extract a short chunk (before journal/year markers)
+        title_guess = ref_text
+        # attempt to cut after year/journal separators
+        split_on = re.split(r"\b(19|20)\d{2}\b", ref_text)
+        if split_on and len(split_on) > 1:
+            title_guess = split_on[0]
+        params = {"query.bibliographic": title_guess[:240], "rows": 1}
+        r = requests.get("https://api.crossref.org/works", params=params, timeout=12)
+        r.raise_for_status()
+        data = r.json().get("message", {})
+        items = data.get("items", [])
+        if items:
+            it = items[0]
+            return it, it.get("DOI")
+    except Exception:
+        return None, None
+    return None, None
+
+# ----------------------------
+# PubMed lookup
+# ----------------------------
+def search_pubmed(ref_text: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """
+    Search PubMed via NCBI E-utilities (esearch + efetch).
+    Returns a minimal item dict compatible with Crossref-converters.
+    """
+    try:
+        base = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+        params = {"db":"pubmed", "term": ref_text, "retmode":"json", "retmax":1}
+        r = requests.get(base, params=params, timeout=12)
         r.raise_for_status()
         data = r.json()
+        ids = data.get("esearchresult", {}).get("idlist", [])
+        if not ids:
+            return None, None
+        pmid = ids[0]
+        fetch = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
+        r2 = requests.get(fetch, params={"db":"pubmed", "id": pmid, "retmode":"xml"}, timeout=12)
+        r2.raise_for_status()
+        xml = r2.text
+        # parse simple fields
+        doi_m = re.search(r'<ArticleId IdType="doi">([^<]+)</ArticleId>', xml)
+        doi = doi_m.group(1) if doi_m else ""
+        title_m = re.search(r"<ArticleTitle>(.*?)</ArticleTitle>", xml, re.S)
+        title = title_m.group(1).strip() if title_m else ""
+        journal_m = re.search(r"<Title>(.*?)</Title>", xml)
+        journal = journal_m.group(1).strip() if journal_m else ""
+        year_m = re.search(r"<PubDate>.*?<Year>(\d{4})</Year>", xml, re.S)
+        year = int(year_m.group(1)) if year_m else 0
+        item = {
+            "title":[title],
+            "container-title":[journal],
+            "DOI": doi,
+            "issued": {"date-parts": [[year]]},
+            "author": []
+        }
+        return item, doi
+    except Exception:
+        return None, None
 
-        items = data["message"].get("items", [])
-        if items:
-            item = items[0]
-            doi = item.get("DOI", "")
-            return item, doi
-    except:
-        return None, ""
+# ----------------------------
+# Google Scholar via SerpAPI (optional)
+# ----------------------------
+def search_google_scholar(ref_text: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """
+    If you have SERPAPI_KEY in Streamlit secrets, this will use SerpAPI's Google Scholar engine.
+    Otherwise it returns (None, None).
+    """
+    key = st.secrets.get("SERPAPI_KEY") if "SERPAPI_KEY" in st.secrets else None
+    if not key:
+        return None, None
+    try:
+        q = urllib.parse.quote_plus(ref_text)
+        url = f"https://serpapi.com/search.json?q={q}&engine=google_scholar&api_key={key}"
+        r = requests.get(url, timeout=12)
+        r.raise_for_status()
+        data = r.json()
+        org = data.get("organic_results", [])
+        if not org:
+            return None, None
+        top = org[0]
+        snippet = top.get("snippet", "")
+        doi_m = DOI_RE.search(snippet)
+        doi = doi_m.group(0) if doi_m else ""
+        title = top.get("title", "")
+        publication = top.get("publication", "")
+        year = top.get("year") or 0
+        item = {
+            "title":[title],
+            "container-title":[publication],
+            "DOI": doi,
+            "issued": {"date-parts": [[int(year) if year else 0]]},
+            "author": []
+        }
+        return item, doi
+    except Exception:
+        return None, None
 
-    return None, ""
-
-
-def convert_to_ris(item):
+# ----------------------------
+# Converters: RIS / BibTeX / EndNote / APA
+# ----------------------------
+def convert_item_to_ris(item: Dict[str, Any]) -> str:
     if not item:
         return ""
-
-    authors = item.get("author", [])
-    au_lines = ""
-
-    for a in authors:
-        family = a.get("family", "")
-        given = a.get("given", "")
-        name = f"{family}, {given}".strip().strip(",")
-        au_lines += f"AU  - {name}\n"
-
-    year = ""
-    if "issued" in item and "date-parts" in item["issued"]:
-        year = item["issued"]["date-parts"][0][0]
-
-    ris = (
-        "TY  - JOUR\n"
-        f"TI  - {item.get('title', [''])[0]}\n"
-        f"JO  - {item.get('container-title', [''])[0]}\n"
-        f"PY  - {year}\n"
-        f"{au_lines}"
-        f"DO  - {item.get('DOI', '')}\n"
-        "ER  - \n\n"
-    )
-    return ris
-
-
-def convert_to_bibtex(item):
-    if not item:
-        return ""
-    
-    authors = item.get("author", [])
-    author_list = []
-    for a in authors:
-        family = a.get("family", "")
-        given = a.get("given", "")
-        author_list.append(f"{given} {family}".strip())
-    
-    year = ""
-    if "issued" in item and "date-parts" in item["issued"]:
-        year = str(item["issued"]["date-parts"][0][0])
-    
-    title = item.get('title', [''])[0]
-    journal = item.get('container-title', [''])[0]
-    doi = item.get('DOI', '')
-    
-    cite_key = f"{authors[0].get('family', 'Unknown')}{year}" if authors else f"Unknown{year}"
-    
-    bibtex = f"""@article{{{cite_key},
-  author = {{{" and ".join(author_list)}}},
-  title = {{{title}}},
-  journal = {{{journal}}},
-  year = {{{year}}},
-  doi = {{{doi}}}
-}}
-
-"""
-    return bibtex
-
-
-def convert_to_endnote(item):
-    if not item:
-        return ""
-    
-    authors = item.get("author", [])
-    author_lines = ""
-    for a in authors:
-        family = a.get("family", "")
-        given = a.get("given", "")
-        author_lines += f"%A {given} {family}\n".strip() + "\n"
-    
-    year = ""
-    if "issued" in item and "date-parts" in item["issued"]:
-        year = str(item["issued"]["date-parts"][0][0])
-    
-    title = item.get('title', [''])[0]
-    journal = item.get('container-title', [''])[0]
-    doi = item.get('DOI', '')
-    
-    endnote = f"""%0 Journal Article
-%T {title}
-{author_lines}%D {year}
-%J {journal}
-%R {doi}
-
-"""
-    return endnote
-
-
-def convert_to_apa(item):
-    if not item:
-        return ""
-    
-    authors = item.get("author", [])
-    if len(authors) == 0:
-        author_str = "Unknown Author"
-    elif len(authors) == 1:
-        a = authors[0]
-        author_str = f"{a.get('family', '')}, {a.get('given', '')}"
-    elif len(authors) == 2:
-        a1 = authors[0]
-        a2 = authors[1]
-        author_str = f"{a1.get('family', '')}, {a1.get('given', '')}, & {a2.get('family', '')}, {a2.get('given', '')}"
-    else:
-        author_list = []
-        for i, a in enumerate(authors[:-1]):
-            author_list.append(f"{a.get('family', '')}, {a.get('given', '')}")
-        last = authors[-1]
-        author_str = ", ".join(author_list) + f", & {last.get('family', '')}, {last.get('given', '')}"
-    
-    year = ""
-    if "issued" in item and "date-parts" in item["issued"]:
-        year = str(item["issued"]["date-parts"][0][0])
-    
-    title = item.get('title', [''])[0]
-    journal = item.get('container-title', [''])[0]
-    doi = item.get('DOI', '')
-    
-    apa = f"{author_str} ({year}). {title}. {journal}. https://doi.org/{doi}\n\n"
-    return apa
-
-
-st.set_page_config(page_title="Reference Converter", page_icon="📚", layout="wide")
-
-st.title("📚 Reference Converter")
-st.markdown("Convert your numbered academic references into multiple citation formats using the Crossref API")
-
-input_method = st.radio(
-    "Choose input method:",
-    options=["📄 Upload PDF", "✍️ Paste Text"],
-    horizontal=True
-)
-
-reference_text = ""
-detected_style = None
-detected_confidence = None
-
-if input_method == "📄 Upload PDF":
-    st.info("**Upload a PDF** containing references. The app will automatically extract text and detect the citation style.")
-    
-    uploaded_file = st.file_uploader(
-        "Choose a PDF file",
-        type=['pdf'],
-        help="Upload a PDF file containing academic references"
-    )
-    
-    if uploaded_file is not None:
-        with st.spinner("Extracting text from PDF..."):
-            pdf_text = extract_text_from_pdf(uploaded_file)
-        
-        if not pdf_text.startswith("Error"):
-            st.success("✅ PDF text extracted successfully!")
-            
-            with st.spinner("Detecting citation style..."):
-                detected_style, detected_confidence = detect_reference_style(pdf_text)
-            
-            col_style1, col_style2 = st.columns(2)
-            with col_style1:
-                st.metric("Detected Citation Style", detected_style)
-            with col_style2:
-                confidence_color = "🟢" if detected_confidence == "High" else "🟡" if detected_confidence == "Medium" else "🔴"
-                st.metric("Confidence Level", f"{confidence_color} {detected_confidence}")
-            
-            with st.expander("📄 View Extracted Text", expanded=False):
-                st.text_area("Extracted PDF Content", pdf_text, height=200)
-            
-            reference_text = pdf_text
+    lines = []
+    typemap = {"journal-article":"JOUR", "book":"BOOK", "book-chapter":"CHAP"}
+    ty = typemap.get(item.get("type",""), "GEN")
+    lines.append(f"TY  - {ty}")
+    if item.get("title"):
+        lines.append(f"TI  - {item['title'][0]}")
+    for a in item.get("author", []):
+        lines.append(f"AU  - {a.get('family','')}, {a.get('given','')}")
+    if item.get("container-title"):
+        lines.append(f"JO  - {item['container-title'][0]}")
+    if item.get("issued", {}).get("date-parts"):
+        lines.append(f"PY  - {item['issued']['date-parts'][0][0]}")
+    if item.get("volume"):
+        lines.append(f"VL  - {item['volume']}")
+    if item.get("issue"):
+        lines.append(f"IS  - {item['issue']}")
+    if item.get("page"):
+        p = item["page"]
+        if "-" in p:
+            sp, ep = p.split("-",1)
+            lines.append(f"SP  - {sp}")
+            lines.append(f"EP  - {ep}")
         else:
-            st.error(pdf_text)
+            lines.append(f"SP  - {p}")
+    if item.get("DOI"):
+        lines.append(f"DO  - {item['DOI']}")
+    if item.get("publisher"):
+        lines.append(f"PB  - {item['publisher']}")
+    lines.append("ER  - ")
+    return "\n".join(lines) + "\n\n"
 
+def convert_item_to_bibtex(item: Dict[str, Any]) -> str:
+    if not item:
+        return ""
+    first_author = (item.get("author") or [{}])[0].get("family","ref")
+    year = ""
+    if item.get("issued", {}).get("date-parts"):
+        year = str(item["issued"]["date-parts"][0][0])
+    key = re.sub(r"\W+","", first_author + year) or "ref"
+    btype = "article" if item.get("type","") == "journal-article" else "misc"
+    authors = " and ".join([f"{a.get('family','')}, {a.get('given','')}" for a in (item.get("author") or [])])
+    title = item.get("title", [""])[0]
+    journal = item.get("container-title", [""])[0]
+    doi = item.get("DOI","")
+    bib = f"@{btype}{{{key},\n"
+    if authors: bib += f"  author = {{{authors}}},\n"
+    if title: bib += f"  title = {{{title}}},\n"
+    if journal: bib += f"  journal = {{{journal}}},\n"
+    if year: bib += f"  year = {{{year}}},\n"
+    if doi: bib += f"  doi = {{{doi}}},\n"
+    bib = bib.rstrip(",\n") + "\n}\n\n"
+    return bib
+
+def raw_ref_to_ris(raw: str) -> str:
+    """Fallback minimal RIS when no metadata found"""
+    txt = raw.strip()
+    if len(txt) > 250:
+        txt = txt[:247] + "..."
+    return f"TY  - GEN\nTI  - {txt}\nER  - \n\n"
+
+# ----------------------------
+# Deduplication
+# ----------------------------
+def canonicalize_for_dedupe(item: Optional[Dict[str,Any]], ref_text: str) -> str:
+    if item and item.get("DOI"):
+        return item["DOI"].lower()
+    s = ref_text.lower()
+    s = re.sub(r"\W+", " ", s)
+    s = re.sub(r"\b(19|20)\d{2}\b", "", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return hashlib.sha1(s.encode("utf-8")).hexdigest()
+
+# ----------------------------
+# Streamlit UI
+# ----------------------------
+st.set_page_config(page_title="Reference → RIS/BibTeX", layout="wide", page_icon="📚")
+
+st.title("📚 Reference Finder & Exporter (Crossref → PubMed → Scholar → Raw→RIS)")
+st.write("Upload a PDF or paste references. App will try Crossref → PubMed → Google Scholar (SerpAPI optional). If nothing found, raw text is converted to RIS.")
+
+# Input
+mode = st.radio("Input method:", ["Paste references", "Upload PDF"], horizontal=True)
+
+raw_text = ""
+if mode == "Paste references":
+    raw_text = st.text_area("Paste references (multi-line). The parser supports numbered and unnumbered lists.", height=300)
 else:
-    st.info("**Paste your references** below (formats like '1.' or '1)' are supported). Each reference can span multiple lines.")
-    
-    reference_text = st.text_area(
-        "Paste your references here:",
-        height=300,
-        placeholder="Example:\n1. Smith, J., & Jones, A. (2020). Article title.\n   Journal Name, 15(2), 123-145.\n2. Brown, B. (2019). Another article...",
-        help="Paste references exactly as copied. Multi-line references are supported."
-    )
-    
-    if reference_text.strip():
-        with st.spinner("Detecting citation style..."):
-            detected_style, detected_confidence = detect_reference_style(reference_text)
-        
-        col_style1, col_style2 = st.columns(2)
-        with col_style1:
-            st.metric("Detected Citation Style", detected_style)
-        with col_style2:
-            confidence_color = "🟢" if detected_confidence == "High" else "🟡" if detected_confidence == "Medium" else "🔴"
-            st.metric("Confidence Level", f"{confidence_color} {detected_confidence}")
-
-export_format = st.selectbox(
-    "Export Format:",
-    options=["RIS", "BibTeX", "EndNote", "APA"],
-    help="Choose the output format for your references"
-)
-
-if 'field_edits' not in st.session_state:
-    st.session_state.field_edits = {}
-
-if st.button("Convert References", type="primary", use_container_width=True):
-    if not reference_text.strip():
-        st.warning("Please paste some references first.")
-    else:
-        references = split_numbered_references(reference_text)
-        
-        if not references:
-            st.warning("No numbered references detected. Make sure your references are numbered (e.g., 1., 2., etc.)")
-        else:
-            st.success(f"Detected {len(references)} reference(s)")
-            
-            validation_warnings = []
-            for idx, ref in enumerate(references, 1):
-                is_valid, issues = validate_reference(ref)
-                if not is_valid:
-                    validation_warnings.append((idx, issues))
-            
-            if validation_warnings:
-                with st.expander("⚠️ Validation Warnings", expanded=False):
-                    for ref_num, issues in validation_warnings:
-                        st.warning(f"**Reference {ref_num}:** {', '.join(issues)}")
-            
-            format_converters = {
-                "RIS": convert_to_ris,
-                "BibTeX": convert_to_bibtex,
-                "EndNote": convert_to_endnote,
-                "APA": convert_to_apa
-            }
-            
-            converter = format_converters[export_format]
-            
-            all_output = ""
-            results = []
-            
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            
-            for idx, ref in enumerate(references):
-                status_text.text(f"Processing reference {idx + 1} of {len(references)}...")
-                
-                item, doi = search_crossref(ref)
-                
-                if doi:
-                    all_output += converter(item)
-                    results.append({
-                        "ref": ref,
-                        "doi": doi,
-                        "title": item.get('title', [''])[0] if item else "",
-                        "item": item,
-                        "found": True
-                    })
+    uploaded = st.file_uploader("Upload PDF(s)", type=["pdf"], accept_multiple_files=True)
+    if uploaded:
+        all_pdf_text = []
+        for f in uploaded:
+            with st.spinner(f"Extracting {f.name} ..."):
+                txt = extract_text_from_pdf(f)
+                if txt.startswith("ERROR:"):
+                    st.error(f"Error reading {f.name}: {txt}")
                 else:
-                    results.append({
-                        "ref": ref,
-                        "doi": None,
-                        "title": "",
-                        "item": None,
-                        "found": False
-                    })
-                
-                progress_bar.progress((idx + 1) / len(references))
-            
-            status_text.empty()
-            progress_bar.empty()
-                
-            st.session_state.results = results
-            st.session_state.all_output = all_output
-            st.session_state.export_format = export_format
-            st.session_state.field_edits = {}
-
-if 'results' in st.session_state and st.session_state.results:
-    results = st.session_state.results
-    all_output = st.session_state.all_output
-    current_export_format = st.session_state.export_format
-    
-    duplicates = detect_duplicates(results)
-    if duplicates:
-        with st.expander("🔍 Duplicate References Detected", expanded=True):
-            for doi, indices in duplicates.items():
-                ref_numbers = [i + 1 for i in indices]
-                st.error(f"**DOI {doi}** appears in references: {', '.join(map(str, ref_numbers))}")
-                st.caption("Consider removing duplicate entries before exporting.")
-    
-    st.subheader("Results & Reference Editing")
-    st.info("Edit any reference details below. Changes will be reflected in the export.")
-    
-    for idx, result in enumerate(results, 1):
-        with st.expander(f"Reference {idx}: {'✅ DOI Found' if result['found'] else '❌ No DOI'}"):
-            st.text(f"Original: {result['ref'][:150]}{'...' if len(result['ref']) > 150 else ''}")
-            
-            if result['found']:
-                st.success(f"**DOI:** {result['doi']}")
-                
-                item = result['item']
-                
-                with st.form(key=f"edit_form_{idx}"):
-                    st.markdown("**Edit Reference Fields:**")
-                    
-                    edited_title = st.text_input(
-                        "Title:",
-                        value=item.get('title', [''])[0],
-                        key=f"title_{idx}"
-                    )
-                    
-                    edited_journal = st.text_input(
-                        "Journal:",
-                        value=item.get('container-title', [''])[0],
-                        key=f"journal_{idx}"
-                    )
-                    
-                    year = ""
-                    if "issued" in item and "date-parts" in item["issued"]:
-                        year = str(item["issued"]["date-parts"][0][0])
-                    
-                    edited_year = st.text_input(
-                        "Year:",
-                        value=year,
-                        key=f"year_{idx}"
-                    )
-                    
-                    edited_doi = st.text_input(
-                        "DOI:",
-                        value=result['doi'],
-                        key=f"doi_{idx}"
-                    )
-                    
-                    submit_edits = st.form_submit_button("Save Edits")
-                    
-                    if submit_edits:
-                        if 'field_edits' not in st.session_state:
-                            st.session_state.field_edits = {}
-                        st.session_state.field_edits[idx - 1] = {
-                            'title': edited_title,
-                            'journal': edited_journal,
-                            'year': edited_year,
-                            'doi': edited_doi
-                        }
-                        st.success("✅ Edits saved! Click 'Regenerate Export' below to apply changes.")
-            else:
-                st.warning("Could not find DOI for this reference")
-                
-                with st.form(key=f"manual_form_{idx}"):
-                    st.markdown("**Manually Add Reference Details:**")
-                    
-                    manual_title = st.text_input(
-                        "Title:",
-                        key=f"manual_title_{idx}"
-                    )
-                    
-                    manual_journal = st.text_input(
-                        "Journal:",
-                        key=f"manual_journal_{idx}"
-                    )
-                    
-                    manual_year = st.text_input(
-                        "Year:",
-                        key=f"manual_year_{idx}"
-                    )
-                    
-                    manual_doi = st.text_input(
-                        "DOI:",
-                        key=f"manual_doi_{idx}",
-                        placeholder="10.1234/example.doi"
-                    )
-                    
-                    submit_manual = st.form_submit_button("Add Manual Entry")
-                    
-                    if submit_manual and manual_doi:
-                        if 'field_edits' not in st.session_state:
-                            st.session_state.field_edits = {}
-                        st.session_state.field_edits[idx - 1] = {
-                            'title': manual_title,
-                            'journal': manual_journal,
-                            'year': manual_year,
-                            'doi': manual_doi
-                        }
-                        st.success("✅ Manual entry saved! Click 'Regenerate Export' below to apply.")
-    
-    if st.session_state.field_edits:
-        st.divider()
-        if st.button("🔄 Regenerate Export with Edits", use_container_width=True):
-            format_converters = {
-                "RIS": convert_to_ris,
-                "BibTeX": convert_to_bibtex,
-                "EndNote": convert_to_endnote,
-                "APA": convert_to_apa
-            }
-            
-            converter = format_converters[current_export_format]
-            updated_output = ""
-            
-            saved_edits = st.session_state.field_edits
-            
-            for idx, result in enumerate(results):
-                if idx in saved_edits:
-                    edits = saved_edits[idx]
-                    
-                    if result['item']:
-                        updated_item = result['item'].copy()
+                    # try to find References section by keyword
+                    m = re.search(r"(References|REFERENCES|Bibliography|BIBLIOGRAPHY)([\s\S]{50,200000})", txt)
+                    if m:
+                        block = m.group(2)
                     else:
-                        updated_item = {
-                            'author': [],
-                            'issued': {'date-parts': [[0]]}
-                        }
-                    
-                    updated_item['title'] = [edits['title']]
-                    updated_item['container-title'] = [edits['journal']]
-                    updated_item['DOI'] = edits['doi']
-                    
-                    try:
-                        year_int = int(edits['year']) if edits['year'] else 0
-                        updated_item['issued'] = {'date-parts': [[year_int]]}
-                    except ValueError:
-                        updated_item['issued'] = {'date-parts': [[0]]}
-                    
-                    updated_output += converter(updated_item)
-                else:
-                    if result['item']:
-                        updated_output += converter(result['item'])
-            
-            st.session_state.all_output = updated_output
-            all_output = updated_output
-            st.success("✅ Export regenerated with your edits!")
-    
-    if all_output:
-        st.subheader(f"{current_export_format} Output")
-        
-        file_extensions = {
-            "RIS": "ris",
-            "BibTeX": "bib",
-            "EndNote": "enw",
-            "APA": "txt"
-        }
-        
-        mime_types = {
-            "RIS": "application/x-research-info-systems",
-            "BibTeX": "application/x-bibtex",
-            "EndNote": "application/x-endnote-refer",
-            "APA": "text/plain"
-        }
-        
-        col1, col2 = st.columns([3, 1])
-        with col1:
-            st.download_button(
-                label=f"📥 Download {current_export_format} File",
-                data=all_output,
-                file_name=f"references.{file_extensions[current_export_format]}",
-                mime=mime_types[current_export_format],
-                use_container_width=True
-            )
-        
-        with st.expander(f"Preview {current_export_format} Format"):
-            st.code(all_output, language="text")
+                        block = txt
+                    all_pdf_text.append(block)
+        raw_text = "\n\n".join(all_pdf_text)
+        if raw_text:
+            st.text_area("Extracted text (from PDF)", raw_text, height=200)
+
+export_format = st.selectbox("Export format:", ["RIS", "BibTeX"], index=0)
+use_serpapi = "SERPAPI_KEY" in st.secrets
+
+if use_serpapi:
+    st.info("SerpAPI key found in Streamlit secrets. Google Scholar fallback enabled.")
+else:
+    st.info("No SerpAPI key found. Google Scholar fallback disabled (optional). Add 'SERPAPI_KEY' to secrets to enable).")
+
+# Process
+if st.button("Process & Generate Export"):
+    if not raw_text.strip():
+        st.warning("Please paste references or upload a PDF first.")
+        st.stop()
+
+    with st.spinner("Splitting references..."):
+        refs = split_references_smart(raw_text)
+    if not refs:
+        st.warning("No references detected after splitting.")
+        st.stop()
+    st.success(f"Detected {len(refs)} references (after splitting).")
+
+    # Detect style (show heuristic)
+    style, conf = detect_reference_style(raw_text)
+    st.info(f"Detected style: **{style}** (confidence: {conf})")
+
+    # Process each with priority search & dedupe
+    ris_blocks = []
+    bib_blocks = []
+    results = []  # list of dicts with original, found, doi, item, source
+    seen_keys = set()
+
+    progress = st.progress(0)
+    status = st.empty()
+
+    for i, ref in enumerate(refs, start=1):
+        status.text(f"Searching {i}/{len(refs)}")
+        # try Crossref
+        item, doi = search_crossref(ref)
+        source = None
+        if doi:
+            source = "Crossref"
+        else:
+            # try PubMed
+            item, doi = search_pubmed(ref)
+            if doi:
+                source = "PubMed"
+        if not doi and use_serpapi:
+            item, doi = search_google_scholar(ref)
+            if doi:
+                source = "Scholar"
+
+        # dedupe key
+        key = canonicalize_for_dedupe(item, ref)
+        if key in seen_keys:
+            results.append({"original": ref, "found": bool(doi), "doi": doi or None, "item": item, "source": source, "status":"duplicate"})
+            progress.progress(i/len(refs))
+            time.sleep(0.2)
+            continue
+        seen_keys.add(key)
+
+        if doi:
+            # convert
+            if export_format == "RIS":
+                ris = convert_item_to_ris(item)
+                ris_blocks.append(ris)
+            else:
+                bib = convert_item_to_bibtex(item)
+                bib_blocks.append(bib)
+            results.append({"original": ref, "found": True, "doi": doi, "item": item, "source": source, "status":"found"})
+        else:
+            # fallback raw -> ris
+            ris = raw_ref_to_ris(ref)
+            ris_blocks.append(ris)
+            bib_blocks.append("")  # empty fallback for bib
+            results.append({"original": ref, "found": False, "doi": None, "item": None, "source":"raw", "status":"fallback"})
+
+        progress.progress(i/len(refs))
+        time.sleep(0.25)
+
+    status.empty()
+    progress.empty()
+
+    # Show duplicates summary
+    duplicates = {}
+    for idx, r in enumerate(results):
+        if r["found"] and r["doi"]:
+            duplicates.setdefault(r["doi"], []).append(idx+1)
+    if duplicates:
+        with st.expander("Duplicate DOIs detected"):
+            for doi, idxs in duplicates.items():
+                if len(idxs) > 1:
+                    st.warning(f"DOI {doi} appears in references: {', '.join(map(str, idxs))}")
+
+    # Show result list
+    st.subheader("Processing summary")
+    for idx, r in enumerate(results, start=1):
+        if r["status"] == "duplicate":
+            st.info(f"{idx}. [DUPLICATE] {r['original'][:150]}... (skipped)")
+        elif r["status"] == "found":
+            st.success(f"{idx}. [FOUND:{r['source']}] DOI: {r['doi']} — {r['original'][:150]}...")
+        else:
+            st.warning(f"{idx}. [FALLBACK RAW→RIS] {r['original'][:150]}...")
+
+    # Aggregate output
+    if export_format == "RIS":
+        final_output = "".join(ris_blocks)
+        if not final_output.strip():
+            st.error("No RIS output generated.")
+        else:
+            st.download_button("Download RIS", data=final_output, file_name="references.ris", mime="application/x-research-info-systems")
+            with st.expander("RIS Preview"):
+                st.code(final_output, language="text")
     else:
-        st.error(f"No references could be converted to {current_export_format} format.")
+        final_output = "".join(bib_blocks)
+        if not final_output.strip():
+            st.error("No BibTeX output generated.")
+        else:
+            st.download_button("Download BibTeX", data=final_output, file_name="references.bib", mime="text/x-bibtex")
+            with st.expander("BibTeX Preview"):
+                st.code(final_output, language="text")
 
-st.divider()
-st.caption("This tool uses the Crossref API to search for DOIs and convert references to multiple citation formats.")
+    # store results for editing/regeneration (simple)
+    st.session_state["last_results"] = results
+    st.session_state["last_ris"] = final_output if export_format == "RIS" else None
+    st.session_state["last_bib"] = final_output if export_format != "RIS" else None
 
+# Optional: allow user to view/edit last results and regenerate export
+if "last_results" in st.session_state:
+    st.markdown("---")
+    st.header("Review / Edit results")
+    editable = []
+    for idx, entry in enumerate(st.session_state["last_results"], start=1):
+        with st.expander(f"Reference {idx} — {'FOUND' if entry['found'] else 'NOT FOUND'}"):
+            st.write("Original:", entry["original"])
+            col1, col2 = st.columns(2)
+            with col1:
+                title = st.text_input(f"title_{idx}", value=(entry["item"].get("title",[entry["original"]]) if entry["item"] else [entry["original"]])[0])
+                journal = st.text_input(f"journal_{idx}", value=(entry["item"].get("container-title",[""])[0] if entry["item"] else ""))
+                doi = st.text_input(f"doi_{idx}", value=(entry["doi"] or ""))
+            with col2:
+                year = st.text_input(f"year_{idx}", value=(str(entry["item"].get("issued",{}).get("date-parts",[[0]])[0][0]) if entry["item"] else ""))
+                save = st.button(f"Save edits {idx}", key=f"save_{idx}")
+                if save:
+                    # write edits back into session state entry
+                    new_item = entry["item"].copy() if entry["item"] else {"title":[title], "container-title":[journal], "issued": {"date-parts":[[int(year) if year.isdigit() else 0]]}}
+                    new_item["title"] = [title]
+                    new_item["container-title"] = [journal]
+                    new_item["DOI"] = doi
+                    try:
+                        new_item["issued"] = {"date-parts":[[int(year)]]}
+                    except Exception:
+                        new_item["issued"] = {"date-parts":[[0]]}
+                    st.session_state["last_results"][idx-1]["item"] = new_item
+                    st.session_state["last_results"][idx-1]["doi"] = doi or None
+                    st.success("Saved edits for entry " + str(idx))
+
+    if st.button("Regenerate Export from Edited Results"):
+        # regenerate based on session results
+        ris_blocks = []
+        bib_blocks = []
+        for entry in st.session_state["last_results"]:
+            it = entry.get("item")
+            if export_format == "RIS":
+                if it:
+                    ris_blocks.append(convert_item_to_ris(it))
+                else:
+                    ris_blocks.append(raw_ref_to_ris(entry["original"]))
+            else:
+                if it:
+                    bib_blocks.append(convert_item_to_bibtex(it))
+                else:
+                    bib_blocks.append("") 
+        final = "".join(ris_blocks) if export_format == "RIS" else "".join(bib_blocks)
+        st.session_state["last_ris" if export_format=="RIS" else "last_bib"] = final
+        st.success("Regenerated export. Use the download button above to get the file.")
+        if final:
+            with st.expander("Preview regenerated output"):
+                st.code(final, language="text")
+
+st.caption("This app queries Crossref and PubMed. Google Scholar fallback via SerpAPI is optional. Add 'SERPAPI_KEY' in Streamlit secrets to enable Scholar search. For large batches consider adding a mailto param and/or longer delays.")
