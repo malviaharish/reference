@@ -747,7 +747,24 @@ if "processed_refs" in st.session_state:
     selections = []
     seen_keys = set()
     for idx, rec in enumerate(processed, start=1):
-        with st.expander(f"Reference {idx}: {rec['original'][:200]}{'...' if len(rec['original'])>200 else ''}"):
+        # Color code based on match score
+        score = rec.get("found_score", 0.0)
+        if score >= 0.85:
+            color_badge = "🟢"  # Green - excellent match
+            color_label = "Excellent"
+        elif score >= 0.70:
+            color_badge = "🟡"  # Yellow - good match
+            color_label = "Good"
+        elif score >= threshold:
+            color_badge = "🟠"  # Orange - acceptable match
+            color_label = "Acceptable"
+        else:
+            color_badge = "🔴"  # Red - poor match
+            color_label = "Poor"
+        
+        expander_title = f"{color_badge} Reference {idx}: {rec['original'][:160]}{'...' if len(rec['original'])>160 else ''} [{color_label} {score:.2f}]"
+        
+        with st.expander(expander_title):
             st.markdown("**Original**")
             st.code(rec["original"])
             # Found block
