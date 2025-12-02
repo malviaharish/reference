@@ -49,6 +49,56 @@ def cached(key: str, fn, *args, **kwargs):
 # -------------------------
 # Utilities
 # -------------------------
+// ...existing code...
+def clean_and_join_broken_lines(text: str) -> str:
+    if text is None:
+        return ""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"(\w+)-\s*\n\s*(\w+)", r"\1\2", text)  # fix hyphenation
+    text = re.sub(r"(?<!\n)\n(?!\n)", " ", text)  # merge single newlines
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    return text.strip()
+# Normalize & fix spacing before parsing / searching
+    fixed_ref = fix_spacing_and_continuous_words(ref_text or "")
+    parsed = None
+    if OPENAI_API_KEY:
+        parsed = openai_parse_reference(fixed_ref)
+    if not parsed:
+        parsed = simple_local_parse(fixed_ref)
+    if not isinstance(parsed.get("authors", []), list):
+        parsed["authors"] = [parsed.get("authors")] if parsed.get("authors") else []
+    title_for_search = parsed.get("title") or fixed_ref[:240]
+
+# New: try to fix missing spaces / continuous words and punctuation spacing in a single reference
+def fix_spacing_and_continuous_words(ref: str) -> str:
+    if not ref:
+        return ref
+    s = clean_and_join_broken_lines(ref)
+    # insert space after punctuation if missing (e.g. "Smith,J" -> "Smith, J")
+    s = re.sub(r'([,\.;:])([A-Za-z0-9])', r'\1 \2', s)
+    # insert space between a lower/digit and an uppercase (common joined words like "etAlSmith" -> "etAl Smith")
+    s = re.sub(r'([a-z0-9])([A-Z])', r'\1 \2', s)
+    # insert space between closing parenthesis and following word if missing
+    s = re.sub(r'(\))([A-Za-z0-9])', r'\1 \2', s)
+    # ensure a space after a period when followed by uppercase (e.g. "J.Doe" -> "J. Doe")
+    s = re.sub(r'\.([A-Z])', r'. \1', s)
+    # collapse multiple spaces
+    s = re.sub(r'\s{2,}', ' ', s).strip()
+    return s
+// ...existing code...
+def process_reference(ref_text: str, threshold: float = DEFAULT_THRESHOLD, auto_accept: bool = True) -> Dict[str,Any]:
+    # Normalize & fix spacing before parsing / searching
+    fixed_ref = fix_spacing_and_continuous_words(ref_text or "")
+    parsed = None
+    if OPENAI_API_KEY:
+        parsed = openai_parse_reference(fixed_ref)
+    if not parsed:
+        parsed = simple_local_parse(fixed_ref)
+    if not isinstance(parsed.get("authors", []), list):
+        parsed["authors"] = [parsed.get("authors")] if parsed.get("authors") else []
+    title_for_search = parsed.get("title") or fixed_ref[:240]
+// ...existing code...
+```// filepath: c:\app\#
 def normalize_text(s: str) -> str:
     if not s:
         return ""
