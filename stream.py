@@ -10,15 +10,15 @@ Full Streamlit app:
 - Export RIS / BibTeX / CSV
 """
 
-from typing import List, Tuple, Optional, Dict, Any
+
 import streamlit as st
+import os
 import re
-import requests
 import json
-import io
-import csv
-import time
 import hashlib
+import time
+import requests
+from typing import List, Tuple, Optional, Dict, Any
 from difflib import SequenceMatcher
 from pypdf import PdfReader
 
@@ -31,7 +31,6 @@ OPENAI_API_KEY = None
 if "OPENAI_API_KEY" in st.secrets:
     OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
 else:
-    import os
     OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 
 OPENAI_MODEL = "gpt-4o-mini"  # change if you need
@@ -918,3 +917,4 @@ if "processed_refs" in st.session_state:
                     st.code(csv_data, language="text")
 
 st.caption("Notes: OpenAI key (optional) stored in Streamlit secrets as OPENAI_API_KEY. The app queries multiple metadata sources — network/API delays apply. Adjust threshold for stricter / looser acceptance of found metadata.")
+
