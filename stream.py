@@ -943,4 +943,169 @@ if "processed_refs" in st.session_state:
 
 st.caption("Notes: OpenAI key (optional) stored in Streamlit secrets as OPENAI_API_KEY. The app queries multiple metadata sources — network/API delays apply. Adjust threshold for stricter / looser acceptance of found metadata.")
 
+# test_pubmed_search_title.py
+import pytest
+from unittest.mock import patch, MagicMock
+import streamlit_ref_tool_final
+
+
+@pytest.fixture
+def sample_xml_response():
+    """Mock XML response from PubMed efetch"""
+    return """<?xml version="1.0"?>
+<PubmedArticleSet>
+  <PubmedArticle>
+    <Article>
+      <ArticleTitle>Test Article Title Here</ArticleTitle>
+      <Journal>
+        <Title>Test Journal</Title>
+      </Journal>
+      <PubDate>
+        <Year>2020</Year>
+      </PubDate>
+      <Pagination>
+        <MedlinePgn>123-145</MedlinePgn>
+      </Pagination>
+      <Volume>42</Volume>
+      <Issue>3</Issue>
+      <AuthorList>
+        <Author>
+          <LastName>Smith</LastName>
+          <ForeName>John</ForeName>
+        </Author>
+        <Author>
+          <LastName>Doe</LastName>
+          <ForeName>Jane</ForeName>
+        </Author>
+      </AuthorList>
+      <ArticleIdList>
+        <ArticleId IdType="doi">10.1234/test.2020.123</ArticleId>
+      </ArticleIdList>
+    </Article>
+  </PubmedArticle>
+</PubmedArticleSet>"""
+
+
+def test_pubmed_search_title_with_valid_title(sample_xml_response):
+    """Test successful search with valid title"""
+    with patch('streamlit_ref_tool_final.requests.get') as mock_get:
+        # Mock esearch response
+        esearch_response = MagicMock()
+        esearch_response.json.return_value = {
+            "esearchresult": {"idlist": ["12345678"]}
+        }
+        # Mock efetch response
+        efetch_response = MagicMock()
+        efetch_response.text = sample_xml_response
+        
+        mock_get.side_effect = [esearch_response, efetch_response]
+        
+        result, doi = streamlit_ref_tool_final.pubmed_search_title("Test Article Title")
+        
+        assert result is not None
+        assert result["title"] == "Test Article Title Here"
+        assert result["journal"] == "Test Journal"
+        assert result["year"] == "2020"
+        assert result["volume"] == "42"
+        assert result["issue"] == "3"
+        assert result["pages"] == "123-145"
+        assert result["doi"] == "10.1234/test.2020.123"
+        assert len(result["authors"]) == 2
+        assert result["authors"][0]["family"] == "Smith"
+        assert result["authors"][0]["given"] == "John"
+
+
+def test_pubmed_search_title_empty_string():
+    """Test with empty title"""
+    result, doi = streamlit_ref_tool_final.pubmed_search_title("")
+    assert result is None
+    assert doi is None
+
+
+def test_pubmed_search_title_none_title():
+    """Test with None title"""
+    result, doi = streamlit_ref_tool_final.pubmed_search_title(None)
+    assert result is None
+    assert doi is None
+
+
+def test_pubmed_search_title_no_results():
+    """Test when esearch returns no results"""
+    with patch('streamlit_ref_tool_final.requests.get') as mock_get:
+        esearch_response = MagicMock()
+        esearch_response.json.return_value = {"esearchresult": {"idlist": []}}
+        mock_get.return_value = esearch_response
+        
+        result, doi = streamlit_ref_tool_final.pubmed_search_title("Nonexistent Article")
+        
+        assert result is None
+        assert doi is None
+
+
+def test_pubmed_search_title_api_exception():
+    """Test handling of API exceptions"""
+    with patch('streamlit_ref_tool_final.requests.get') as mock_get:
+        mock_get.side_effect = Exception("Network error")
+        
+        result, doi = streamlit_ref_tool_final.pubmed_search_title("Some Title")
+        
+        assert result is None
+        assert doi is None
+
+
+def test_pubmed_search_title_multiple_results_picks_best_similarity(sample_xml_response):
+    """Test that function picks best match by similarity when multiple results"""
+    xml_poor = """<?xml version="1.0"?>
+<PubmedArticleSet>
+  <PubmedArticle>
+    <Article>
+      <ArticleTitle>Completely Different Article</ArticleTitle>
+      <Journal><Title>J</Title></Journal>
+      <PubDate><Year>2019</Year></PubDate>
+      <Pagination><MedlinePgn>1-10</MedlinePgn></Pagination>
+      <Volume>1</Volume>
+      <Issue>1</Issue>
+    </Article>
+  </PubmedArticle>
+</PubmedArticleSet>"""
+    
+    with patch('streamlit_ref_tool_final.requests.get') as mock_get:
+        esearch_response = MagicMock()
+        esearch_response.json.return_value = {
+            "esearchresult": {"idlist": ["111", "222"]}
+        }
+        efetch_poor = MagicMock()
+        efetch_poor.text = xml_poor
+        efetch_good = MagicMock()
+        efetch_good.text = sample_xml_response
+        
+        mock_get.side_effect = [esearch_response, efetch_poor, efetch_good]
+        
+        result, doi = streamlit_ref_tool_final.pubmed_search_title("Test Article Title Here")
+        
+        # Should pick the second result (better similarity)
+        assert result is not None
+        assert result["title"] == "Test Article Title Here"
+
+
+def test_pubmed_search_title_caching():
+    """Test that results are cached"""
+    with patch('streamlit_ref_tool_final.requests.get') as mock_get:
+        esearch_response = MagicMock()
+        esearch_response.json.return_value = {"esearchresult": {"idlist": []}}
+        mock_get.return_value = esearch_response
+        
+        # Clear cache first
+        streamlit_ref_tool_final.API_CACHE.clear()
+        
+        # First call
+        streamlit_ref_tool_final.pubmed_search_title("Cached Title")
+        call_count_1 = mock_get.call_count
+        
+        # Second call (should use cache)
+        streamlit_ref_tool_final.pubmed_search_title("Cached Title")
+        call_count_2 = mock_get.call_count
+        
+        # Should not make additional API calls
+        assert call_count_2 == call_count_1
 
