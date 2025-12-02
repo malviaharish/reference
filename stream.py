@@ -683,6 +683,32 @@ with col_right:
     else:
         st.info("No OpenAI key — AI parsing disabled (will use local heuristics)")
 
+    # Visible colour/score legend for the page
+    st.markdown("### Match score legend")
+    st.markdown(
+        """
+        <div style="display:flex;flex-direction:column;gap:6px;">
+          <div style="display:flex;gap:8px;align-items:center;">
+            <span style="display:inline-block;width:14px;height:14px;background:#16a34a;border-radius:3px;"></span>
+            <strong>Excellent</strong> — score ≥ 0.85 (🟢)
+          </div>
+          <div style="display:flex;gap:8px;align-items:center;">
+            <span style="display:inline-block;width:14px;height:14px;background:#f59e0b;border-radius:3px;"></span>
+            <strong>Good</strong> — 0.70 ≤ score &lt; 0.85 (🟡)
+          </div>
+          <div style="display:flex;gap:8px;align-items:center;">
+            <span style="display:inline-block;width:14px;height:14px;background:#f97316;border-radius:3px;"></span>
+            <strong>Acceptable</strong> — score ≥ threshold (🟠)
+          </div>
+          <div style="display:flex;gap:8px;align-items:center;">
+            <span style="display:inline-block;width:14px;height:14px;background:#ef4444;border-radius:3px;"></span>
+            <strong>Poor</strong> — score &lt; threshold (🔴)
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
 with col_left:
     mode = st.radio("Input method", ["Paste references", "Upload PDF(s)"], horizontal=True)
     raw_text = ""
