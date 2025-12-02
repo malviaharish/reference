@@ -647,7 +647,7 @@ def process_reference(ref_text: str, threshold: float = DEFAULT_THRESHOLD, auto_
 # -------------------------
 # Streamlit UI
 # -------------------------
-st.title("📚 Reference Finder — Compare Found Metadata vs AI-parsed (choose per-ref)")
+st.title("📚 Reference Finder")
 
 st.markdown("""
 Paste references or upload PDF(s). The app will parse each reference (OpenAI optional) and search Crossref, PubMed, Europe PMC, Semantic Scholar and OpenAlex by title.
@@ -942,4 +942,5 @@ if "processed_refs" in st.session_state:
                     st.code(csv_data, language="text")
 
 st.caption("Notes: OpenAI key (optional) stored in Streamlit secrets as OPENAI_API_KEY. The app queries multiple metadata sources — network/API delays apply. Adjust threshold for stricter / looser acceptance of found metadata.")
+
 
