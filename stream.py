@@ -18,6 +18,8 @@ import json
 import hashlib
 import time
 import requests
+import io
+import csv
 from typing import List, Tuple, Optional, Dict, Any
 from difflib import SequenceMatcher
 from pypdf import PdfReader
@@ -49,56 +51,6 @@ def cached(key: str, fn, *args, **kwargs):
 # -------------------------
 # Utilities
 # -------------------------
-// ...existing code...
-def clean_and_join_broken_lines(text: str) -> str:
-    if text is None:
-        return ""
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-    text = re.sub(r"(\w+)-\s*\n\s*(\w+)", r"\1\2", text)  # fix hyphenation
-    text = re.sub(r"(?<!\n)\n(?!\n)", " ", text)  # merge single newlines
-    text = re.sub(r"[ \t]{2,}", " ", text)
-    return text.strip()
-# Normalize & fix spacing before parsing / searching
-    fixed_ref = fix_spacing_and_continuous_words(ref_text or "")
-    parsed = None
-    if OPENAI_API_KEY:
-        parsed = openai_parse_reference(fixed_ref)
-    if not parsed:
-        parsed = simple_local_parse(fixed_ref)
-    if not isinstance(parsed.get("authors", []), list):
-        parsed["authors"] = [parsed.get("authors")] if parsed.get("authors") else []
-    title_for_search = parsed.get("title") or fixed_ref[:240]
-
-# New: try to fix missing spaces / continuous words and punctuation spacing in a single reference
-def fix_spacing_and_continuous_words(ref: str) -> str:
-    if not ref:
-        return ref
-    s = clean_and_join_broken_lines(ref)
-    # insert space after punctuation if missing (e.g. "Smith,J" -> "Smith, J")
-    s = re.sub(r'([,\.;:])([A-Za-z0-9])', r'\1 \2', s)
-    # insert space between a lower/digit and an uppercase (common joined words like "etAlSmith" -> "etAl Smith")
-    s = re.sub(r'([a-z0-9])([A-Z])', r'\1 \2', s)
-    # insert space between closing parenthesis and following word if missing
-    s = re.sub(r'(\))([A-Za-z0-9])', r'\1 \2', s)
-    # ensure a space after a period when followed by uppercase (e.g. "J.Doe" -> "J. Doe")
-    s = re.sub(r'\.([A-Z])', r'. \1', s)
-    # collapse multiple spaces
-    s = re.sub(r'\s{2,}', ' ', s).strip()
-    return s
-// ...existing code...
-def process_reference(ref_text: str, threshold: float = DEFAULT_THRESHOLD, auto_accept: bool = True) -> Dict[str,Any]:
-    # Normalize & fix spacing before parsing / searching
-    fixed_ref = fix_spacing_and_continuous_words(ref_text or "")
-    parsed = None
-    if OPENAI_API_KEY:
-        parsed = openai_parse_reference(fixed_ref)
-    if not parsed:
-        parsed = simple_local_parse(fixed_ref)
-    if not isinstance(parsed.get("authors", []), list):
-        parsed["authors"] = [parsed.get("authors")] if parsed.get("authors") else []
-    title_for_search = parsed.get("title") or fixed_ref[:240]
-// ...existing code...
-```// filepath: c:\app\#
 def normalize_text(s: str) -> str:
     if not s:
         return ""
@@ -111,28 +63,13 @@ def similarity(a: str, b: str) -> float:
 
 DOI_RE = re.compile(r"10\.\d{4,9}/[-._;()/:A-Za-z0-9]+")
 def text_hash_for_dedupe(s: str) -> str:
-    s2 = normalize_text(s.lower())
+    s2 = normalize_text((s or "").lower())
     s2 = re.sub(r"\b(19|20)\d{2}\b", "", s2)
     s2 = re.sub(r"\W+", " ", s2)
     return hashlib.sha1(s2.encode("utf-8")).hexdigest()
 
 # -------------------------
-# PDF extraction
-# -------------------------
-def extract_text_from_pdf(uploaded_file) -> str:
-    try:
-        reader = PdfReader(uploaded_file)
-        pages = []
-        for p in reader.pages:
-            t = p.extract_text()
-            if t:
-                pages.append(t)
-        return "\n".join(pages)
-    except Exception as e:
-        return f"ERROR_PDF_EXTRACT: {e}"
-
-# -------------------------
-# Clean & split
+# Clean / fix spacing / split
 # -------------------------
 def clean_and_join_broken_lines(text: str) -> str:
     if text is None:
@@ -143,16 +80,31 @@ def clean_and_join_broken_lines(text: str) -> str:
     text = re.sub(r"[ \t]{2,}", " ", text)
     return text.strip()
 
+def fix_spacing_and_continuous_words(ref: str) -> str:
+    """Try to fix missing spaces, punctuation spacing and collapsed words in a single reference."""
+    if not ref:
+        return ""
+    s = clean_and_join_broken_lines(ref)
+    # insert space after punctuation if missing (e.g. "Smith,J" -> "Smith, J")
+    s = re.sub(r'([,\.;:])([A-Za-z0-9])', r'\1 \2', s)
+    # insert space between a lower/digit and an uppercase (e.g. "etAlSmith" -> "etAl Smith")
+    s = re.sub(r'([a-z0-9])([A-Z][a-z])', r'\1 \2', s)
+    # insert space between closing parenthesis and following word if missing
+    s = re.sub(r'(\))([A-Za-z0-9])', r'\1 \2', s)
+    # ensure a space after a period when followed by uppercase initial (e.g. "J.Doe" -> "J. Doe")
+    s = re.sub(r'\.([A-Z])', r'. \1', s)
+    # collapse multiple spaces
+    s = re.sub(r'\s{2,}', ' ', s).strip()
+    return s
+
 def split_references_smart(text: str) -> List[str]:
     """Returns list of references (keeps multiline references together)."""
     if not text:
         return []
-    # Normalize and fix hyphenation
     text = text.strip()
     # If the text contains double newlines, use them as separators first
     if '\n\n' in text:
         blocks = [b.strip() for b in text.split('\n\n') if b.strip()]
-        # Further split blocks that contain multiple numbered refs
         out = []
         for b in blocks:
             out.extend(_split_block_numbered_or_heuristic(b))
@@ -161,30 +113,23 @@ def split_references_smart(text: str) -> List[str]:
         return _split_block_numbered_or_heuristic(text)
 
 def _split_block_numbered_or_heuristic(block: str) -> List[str]:
-    # Normalize internal newlines and join broken lines
     block = clean_and_join_broken_lines(block)
     lines = [l for l in re.split(r"\n", block) if l.strip()]
-    # Group lines: if a line starts with numbering -> start new ref, else continuation
     refs = []
     cur = []
     for ln in lines:
         if re.match(r"^\s*(?:\[\d+\]|\d+[\.\)])\s+", ln):
-            # New numbered ref
             if cur:
                 refs.append(" ".join(cur).strip())
-            # remove the leading number
             ln2 = re.sub(r"^\s*(?:\[\d+\]|\d+[\.\)])\s*", "", ln)
             cur = [ln2.strip()]
         else:
-            # Heuristic: if line looks like the start of a new reference (Author pattern like "Lastname Initial" and capitalized) and current line ends with '.' and contains pages/vol? We'll treat as new if very likely.
             if cur:
                 cur.append(ln.strip())
             else:
-                # start new anyway
                 cur = [ln.strip()]
     if cur:
         refs.append(" ".join(cur).strip())
-    # If still only one ref but the block contains sequences like "1. ... 2. ..." we split by numbered tokens
     if len(refs) == 1 and re.search(r"(?:\n|\s)(?:\[\d+\]|\d+[\.\)])\s+", block):
         parts = re.split(r"(?:\n\s*)?(?:\[\d+\]|\d+[\.\)])\s*", block)
         parts = [p.strip() for p in parts if p.strip()]
@@ -209,33 +154,26 @@ def simple_local_parse(ref_text: str) -> Dict[str,Any]:
     # Attempt split: authors . title . journal ...
     parts = re.split(r"\.\s+", txt)
     if len(parts) >= 3:
-        # assume first = authors, second = title, rest include journal/vol/pages
         parsed["authors"] = [a.strip().rstrip('.') for a in re.split(r";|, (?=[A-Z][a-z])", parts[0]) if a.strip()]
         parsed["title"] = parts[1].strip()
-        # guess journal as next segment (may include vol/pages)
         rest = ". ".join(parts[2:]).strip()
-        # separate pages vol by colon or numbers
         vp = re.search(r"(?P<journal>.*?)(?:\s+)(?P<vol>\d+)\s*[:(]\s*(?P<pages>[\d\-–]+)", rest)
         if vp:
             parsed["journal"] = vp.group("journal").strip().rstrip(',')
             parsed["volume"] = vp.group("vol") or ""
             parsed["pages"] = vp.group("pages") or ""
         else:
-            # split at last period for journal
             parsed["journal"] = parts[2].strip()
     elif len(parts) == 2:
         parsed["title"] = parts[0].strip()
         parsed["journal"] = parts[1].strip()
     else:
-        # fallback: try to extract title by quotes or italics markers (rare)
         q = re.search(r'“([^”]+)”|"([^"]+)"', txt)
         if q:
             title = q.group(1) or q.group(2)
             parsed["title"] = title.strip()
         else:
-            # otherwise take first 120 chars as title fallback
             parsed["title"] = txt[:120].strip()
-    # pages fallback
     pg = re.search(r"(\d{1,4}\s*[-–]\s*\d{1,4})", txt)
     if pg:
         parsed["pages"] = pg.group(1).replace(" ", "")
@@ -544,9 +482,7 @@ def family_list_from_found(found_authors: List[Any]) -> List[str]:
     return fams
 
 def compute_match_score(parsed: Dict[str,Any], found: Dict[str,Any]) -> float:
-    # Title sim 45%
     title_sim = similarity(parsed.get("title","") or "", found.get("title","") or "")
-    # First author 20%
     parsed_first = first_family_from_list(parsed.get("authors", []) or [])
     found_first = ""
     fa = found.get("authors", []) or []
@@ -556,7 +492,6 @@ def compute_match_score(parsed: Dict[str,Any], found: Dict[str,Any]) -> float:
         else:
             found_first = str(fa[0]).split()[-1] if fa else ""
     first_author_score = 1.0 if (parsed_first and found_first and parsed_first.lower() == found_first.lower()) else 0.0
-    # Other authors 10%
     parsed_fams = family_list_from_parsed(parsed.get("authors", []) or [])
     found_fams = family_list_from_found(found.get("authors", []) or [])
     if parsed_fams and found_fams:
@@ -573,13 +508,10 @@ def compute_match_score(parsed: Dict[str,Any], found: Dict[str,Any]) -> float:
             other_score = 0.0
     else:
         other_score = 0.0
-    # Year 10%
     parsed_year = str(parsed.get("year","") or "")
     found_year = str(found.get("year","") or "")
     year_score = 1.0 if (parsed_year and found_year and parsed_year == found_year) else 0.0
-    # Journal 10%
     journal_score = similarity(parsed.get("journal","") or "", found.get("journal","") or "")
-    # Pages 5%
     parsed_pages = str(parsed.get("pages","") or "")
     found_pages = str(found.get("pages","") or "")
     pages_score = 0.0
@@ -606,7 +538,6 @@ def convert_meta_to_ris(meta: Dict[str,Any]) -> str:
     title = meta.get("title","") if not isinstance(meta.get("title"), list) else (meta.get("title")[0] if meta.get("title") else "")
     if title:
         lines.append(f"TI  - {title}")
-    # authors
     for a in meta.get("authors", [])[:200]:
         if isinstance(a, dict):
             fam = a.get("family","")
@@ -649,7 +580,7 @@ def convert_meta_to_bib(meta: Dict[str,Any]) -> str:
     doi = meta.get("doi","")
     key = "ref"
     if authors and isinstance(authors[0], dict):
-        key = re.sub(r"\W+","", authors[0].get("family","") + year)
+        key = re.sub(r"\W+","", authors[0].get("family","") + (year or ""))
     bib = f"@article{{{key},\n"
     if author_str: bib += f"  author = {{{author_str}}},\n"
     if title: bib += f"  title = {{{title}}},\n"
@@ -663,14 +594,16 @@ def convert_meta_to_bib(meta: Dict[str,Any]) -> str:
 # Main processing per reference
 # -------------------------
 def process_reference(ref_text: str, threshold: float = DEFAULT_THRESHOLD, auto_accept: bool = True) -> Dict[str,Any]:
+    # Normalize & fix spacing before parsing / searching
+    fixed_ref = fix_spacing_and_continuous_words(ref_text or "")
     parsed = None
     if OPENAI_API_KEY:
-        parsed = openai_parse_reference(ref_text)
+        parsed = openai_parse_reference(fixed_ref)
     if not parsed:
-        parsed = simple_local_parse(ref_text)
+        parsed = simple_local_parse(fixed_ref)
     if not isinstance(parsed.get("authors", []), list):
         parsed["authors"] = [parsed.get("authors")] if parsed.get("authors") else []
-    title_for_search = parsed.get("title") or ref_text[:240]
+    title_for_search = parsed.get("title") or fixed_ref[:240]
 
     # Query multiple sources
     candidates = []
@@ -702,9 +635,8 @@ def process_reference(ref_text: str, threshold: float = DEFAULT_THRESHOLD, auto_
 
     choose_found = best_item is not None and best_score >= threshold and auto_accept
 
-    # Return structure:
     return {
-        "original": ref_text,
+        "original": fixed_ref,
         "parsed": parsed,
         "found": best_item,
         "found_source": best_source,
