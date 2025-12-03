@@ -14,7 +14,7 @@ st.set_page_config(page_title="Reference → RIS", layout="wide")
 # Config / Secrets
 # -------------------------
 OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY") or os.environ.get("OPENAI_API_KEY")
-OPENAI_MODEL = "gpt-4"
+OPENAI_MODEL = "gpt-4o-mini"
 
 # -------------------------
 # Utilities
@@ -198,3 +198,4 @@ if st.button("Process References"):
     final_ris = "\n".join(results)
     st.download_button("Download RIS", data=final_ris, file_name="references.ris", mime="application/x-research-info-systems")
     st.text_area("RIS Preview", final_ris, height=400)
+
