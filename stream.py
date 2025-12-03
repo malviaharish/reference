@@ -1,306 +1,234 @@
 # app.py
-"""
-Streamlit app: search Crossref + PubMed by title or DOI and convert results to RIS
-Requirements: streamlit, requests, pypdf (optional for PDF), python-dateutil
-Install with:
-pip install streamlit requests python-dateutil
-Run:
-streamlit run app.py
-"""
-
 import streamlit as st
 import requests
 import re
-import io
 import time
-from typing import Optional, Dict, Any, Tuple, List
 from xml.etree import ElementTree as ET
 from dateutil import parser as dateparser
+from openai import OpenAI
 
-st.set_page_config(page_title="Title/DOI → Search (Crossref / PubMed) → RIS", layout="wide")
+# ----------------------------- CONFIG -----------------------------------
 
-DOI_RE = re.compile(r"10\.\d{4,9}/[-._;()/:A-Za-z0-9]+")
+st.set_page_config(page_title="Reference Parser + Search + RIS Generator", layout="wide")
+
+OPENAI_MODEL = "gpt-4o"
+client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+
 CROSSREF_API = "https://api.crossref.org/works"
 EUTILS_SEARCH = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
 EUTILS_FETCH = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
 
-st.title("🔎 Title/DOI → Crossref & PubMed → RIS")
-st.markdown(
-    "Paste one **title or DOI per line**. App will try Crossref (DOI exact or title search) then PubMed, show found metadata and let you download results as **RIS**."
-)
+DOI_RE = re.compile(r"10\.\d{4,9}/[-._;()/:A-Za-z0-9]+")
 
-with st.expander("Example inputs (copy/paste)"):
-    st.code("""10.1002/jbm.b.30864
-Recent advances in silicone pressure-sensitive adhesives
-Tissues and bone adhesives – historical aspects""")
+# ----------------------------- UI ---------------------------------------
 
-inp = st.text_area("Titles or DOIs (one per line)", height=220)
-use_crossref = st.checkbox("Use Crossref (recommended)", value=True)
-use_pubmed = st.checkbox("Use PubMed (fallback)", value=True)
-timeout_seconds = st.slider("HTTP timeout (seconds)", 5, 30, 10)
+st.title("📘 Paste References → AI Parsing → Crossref + PubMed → RIS Export")
 
-def is_doi(s: str) -> Optional[str]:
-    if not s:
-        return None
-    s = s.strip()
+st.markdown("""
+### Paste *any* reference format:
+- Numbered references  
+- Multi-line references  
+- Journals, books, conference papers  
+- With or without DOI  
+
+The app will **automatically extract** metadata using GPT-4o and then search online databases.
+""")
+
+example = """
+[7] S.B. Lin, L.D. Durfee, R.A. Ekeland, J. Mcvie, G.K. Schalau, Recent advances in silicone pressure-sensitive adhesives, 
+J. Adhes. Sci. Technol. 21 (2007) 605–623.
+
+[8] M. Donkerwolcke, F. Burny, D. Muster, Tissues and bone adhesives-historical aspects, Biomaterials 19 (1998) 1461–1466.
+"""
+
+with st.expander("Example input"):
+    st.code(example)
+
+raw_input_text = st.text_area("Paste your references here:", height=300)
+
+use_crossref = st.checkbox("Use Crossref", value=True)
+use_pubmed = st.checkbox("Use PubMed", value=True)
+
+# ----------------------------- FUNCTIONS ---------------------------------------
+
+def ai_extract_metadata(ref_text: str):
+    """Use GPT-4o to extract title, DOI, year, journal, etc."""
+    prompt = f"""
+Extract clean metadata from the following reference. Return JSON with the following keys:
+title, authors (array of 'Family, Given'), journal, year, volume, issue, pages, doi (if available).
+
+Reference:
+{ref_text}
+"""
+    try:
+        response = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0
+        )
+        import json
+        return json.loads(response.choices[0].message["content"])
+    except Exception as e:
+        return {"title": ref_text, "authors": [], "journal": "", "year": "", "volume": "", "issue": "", "pages": "", "doi": ""}
+
+def is_doi(s: str):
     m = DOI_RE.search(s)
     return m.group(0) if m else None
 
-def crossref_lookup_by_doi(doi: str, timeout: int=10) -> Tuple[Optional[Dict[str,Any]], Optional[str]]:
-    try:
-        url = f"{CROSSREF_API}/{requests.utils.requote_uri(doi)}"
-        r = requests.get(url, timeout=timeout)
-        r.raise_for_status()
-        data = r.json().get("message", {})
-        return crossref_item_to_meta(data), None
-    except Exception as e:
-        return None, str(e)
 
-def crossref_search_title(title: str, timeout: int=10) -> Tuple[Optional[Dict[str,Any]], Optional[str]]:
+# ---- Crossref Lookup ----
+
+def crossref_lookup_by_doi(doi: str):
     try:
-        params = {"query.title": title, "rows": 1}
-        r = requests.get(CROSSREF_API, params=params, timeout=timeout)
+        url = f"{CROSSREF_API}/{doi}"
+        r = requests.get(url)
         r.raise_for_status()
-        items = r.json().get("message", {}).get("items", [])
+        data = r.json()["message"]
+        return {
+            "title": data["title"][0] if data.get("title") else "",
+            "authors": [{"family": a.get("family", ""), "given": a.get("given", "")} for a in data.get("author", [])],
+            "journal": data.get("container-title", [""])[0],
+            "year": str(data.get("issued", {}).get("date-parts", [[None]])[0][0]),
+            "volume": data.get("volume", ""),
+            "issue": data.get("issue", ""),
+            "pages": data.get("page", ""),
+            "doi": data.get("DOI", "")
+        }
+    except:
+        return None
+
+def crossref_search_title(title: str):
+    try:
+        r = requests.get(CROSSREF_API, params={"query.title": title, "rows": 1})
+        r.raise_for_status()
+        items = r.json()["message"]["items"]
         if not items:
-            return None, None
-        return crossref_item_to_meta(items[0]), None
-    except Exception as e:
-        return None, str(e)
+            return None
+        item = items[0]
+        return {
+            "title": item["title"][0] if item.get("title") else "",
+            "authors": [{"family": a.get("family", ""), "given": a.get("given", "")} for a in item.get("author", [])],
+            "journal": item.get("container-title", [""])[0],
+            "year": str(item.get("issued", {}).get("date-parts", [[None]])[0][0]),
+            "volume": item.get("volume", ""),
+            "issue": item.get("issue", ""),
+            "pages": item.get("page", ""),
+            "doi": item.get("DOI", "")
+        }
+    except:
+        return None
 
-def crossref_item_to_meta(item: Dict[str,Any]) -> Dict[str,Any]:
-    authors = []
-    for a in item.get("author", []) or []:
-        fam = a.get("family", "")
-        giv = a.get("given", "")
-        if fam or giv:
-            authors.append({"family": fam, "given": giv})
-    title = ""
-    if item.get("title"):
-        if isinstance(item["title"], list):
-            title = item["title"][0]
-        else:
-            title = item["title"]
-    year = ""
+
+# ---- PubMed ----
+
+def pubmed_search_title(title: str):
     try:
-        issued = item.get("issued", {}).get("date-parts", [[]])
-        if issued and issued[0]:
-            year = str(issued[0][0])
-    except Exception:
-        year = ""
+        r = requests.get(EUTILS_SEARCH, params={"db": "pubmed", "term": title + "[Title]", "retmax": 1, "retmode": "xml"})
+        root = ET.fromstring(r.text)
+        idnode = root.find(".//Id")
+        if idnode is None:
+            return None
+        return pubmed_fetch(idnode.text)
+    except:
+        return None
+
+def pubmed_fetch(pmid: str):
+    r = requests.get(EUTILS_FETCH, params={"db": "pubmed", "id": pmid, "retmode": "xml"})
+    root = ET.fromstring(r.text)
+    title = root.find(".//ArticleTitle")
+    journal = root.find(".//Journal/Title")
+    year = root.find(".//PubDate/Year")
+
     meta = {
-        "title": title,
-        "authors": authors,
-        "journal": item.get("container-title", [""])[0] if item.get("container-title") else "",
-        "year": year,
-        "volume": str(item.get("volume","") or ""),
-        "issue": str(item.get("issue","") or ""),
-        "pages": item.get("page","") or "",
-        "doi": item.get("DOI","") or ""
+        "title": title.text if title is not None else "",
+        "journal": journal.text if journal is not None else "",
+        "year": year.text if year is not None else "",
+        "authors": [],
+        "volume": "",
+        "issue": "",
+        "pages": "",
+        "doi": ""
     }
+
+    for a in root.findall(".//Author"):
+        ln = a.find("LastName")
+        fn = a.find("ForeName")
+        if ln is not None:
+            meta["authors"].append({"family": ln.text, "given": fn.text if fn is not None else ""})
+
+    for aid in root.findall(".//ArticleId"):
+        if aid.get("IdType") == "doi":
+            meta["doi"] = aid.text
+
     return meta
 
-def pubmed_search_by_title(title: str, timeout: int=10) -> Tuple[Optional[Dict[str,Any]], Optional[str]]:
-    try:
-        params = {"db": "pubmed", "term": title + "[Title]", "retmax": 1, "retmode": "xml"}
-        r = requests.get(EUTILS_SEARCH, params=params, timeout=timeout)
-        r.raise_for_status()
-        root = ET.fromstring(r.content)
-        id_elems = root.findall(".//Id")
-        if not id_elems:
-            return None, None
-        pmid = id_elems[0].text
-        return pubmed_fetch_by_pmid(pmid, timeout=timeout)
-    except Exception as e:
-        return None, str(e)
 
-def pubmed_search_by_doi(doi: str, timeout: int=10) -> Tuple[Optional[Dict[str,Any]], Optional[str]]:
-    try:
-        params = {"db": "pubmed", "term": doi + "[AID]", "retmax": 1, "retmode": "xml"}
-        r = requests.get(EUTILS_SEARCH, params=params, timeout=timeout)
-        r.raise_for_status()
-        root = ET.fromstring(r.content)
-        id_elems = root.findall(".//Id")
-        if not id_elems:
-            return None, None
-        pmid = id_elems[0].text
-        return pubmed_fetch_by_pmid(pmid, timeout=timeout)
-    except Exception as e:
-        return None, str(e)
-
-def pubmed_fetch_by_pmid(pmid: str, timeout: int=10) -> Tuple[Optional[Dict[str,Any]], Optional[str]]:
-    try:
-        params = {"db": "pubmed", "id": pmid, "retmode": "xml"}
-        r = requests.get(EUTILS_FETCH, params=params, timeout=timeout)
-        r.raise_for_status()
-        root = ET.fromstring(r.content)
-        # Title
-        atitle = root.find(".//ArticleTitle")
-        title = atitle.text if atitle is not None else ""
-        # Authors
-        authors = []
-        for author in root.findall(".//Author"):
-            ln = author.find("LastName")
-            fn = author.find("ForeName")
-            if ln is not None:
-                authors.append({"family": ln.text or "", "given": fn.text or ""})
-        # Journal
-        j = root.find(".//Journal/Title")
-        journal = j.text if j is not None else ""
-        # Year
-        year = ""
-        # PubDate may be year or medline date
-        pubdate = root.find(".//PubDate")
-        if pubdate is not None:
-            # try Year
-            y = pubdate.find("Year")
-            if y is not None and y.text:
-                year = y.text
-            else:
-                # find MedlineDate or try parse
-                md = pubdate.find("MedlineDate")
-                if md is not None and md.text:
-                    try:
-                        year = str(dateparser.parse(md.text, fuzzy=True).year)
-                    except Exception:
-                        year = ""
-        # Volume/Issue/Pages
-        vol = (root.find(".//Volume").text if root.find(".//Volume") is not None else "") or ""
-        issue = (root.find(".//Issue").text if root.find(".//Issue") is not None else "") or ""
-        pages = (root.find(".//MedlinePgn").text if root.find(".//MedlinePgn") is not None else "") or ""
-        # DOI from ArticleIdList
-        doi = ""
-        for aid in root.findall(".//ArticleId"):
-            if aid.get("IdType") == "doi":
-                doi = aid.text or ""
-        meta = {
-            "title": title,
-            "authors": authors,
-            "journal": journal,
-            "year": year,
-            "volume": vol,
-            "issue": issue,
-            "pages": pages,
-            "doi": doi
-        }
-        return meta, None
-    except Exception as e:
-        return None, str(e)
-
-def meta_to_ris(meta: Dict[str,Any]) -> str:
-    """Convert a metadata dict to a RIS string for a journal article."""
-    lines = ["TY  - JOUR"]
-    title = meta.get("title","")
-    if title:
-        lines.append(f"TI  - {title}")
+# ---- RIS Converter ----
+def to_ris(meta):
+    out = ["TY  - JOUR"]
+    if meta.get("title"): out.append(f"TI  - {meta['title']}")
     for a in meta.get("authors", []):
-        if isinstance(a, dict):
-            fam = a.get("family","").strip()
-            giv = a.get("given","").strip()
-            if giv:
-                au = f"{fam}, {giv}"
-            else:
-                au = fam
-        else:
-            au = str(a)
-        if au:
-            lines.append(f"AU  - {au}")
-    if meta.get("journal"):
-        lines.append(f"JO  - {meta.get('journal')}")
-    if meta.get("volume"):
-        lines.append(f"VL  - {meta.get('volume')}")
-    if meta.get("issue"):
-        lines.append(f"IS  - {meta.get('issue')}")
-    if meta.get("pages"):
-        lines.append(f"SP  - {meta.get('pages')}")
-    if meta.get("year"):
-        lines.append(f"PY  - {meta.get('year')}")
-    if meta.get("doi"):
-        lines.append(f"DO  - {meta.get('doi')}")
-    lines.append("ER  - ")
-    return "\n".join(lines) + "\n\n"
+        out.append(f"AU  - {a['family']}, {a['given']}")
+    if meta.get("journal"): out.append(f"JO  - {meta['journal']}")
+    if meta.get("year"): out.append(f"PY  - {meta['year']}")
+    if meta.get("volume"): out.append(f"VL  - {meta['volume']}")
+    if meta.get("issue"): out.append(f"IS  - {meta['issue']}")
+    if meta.get("pages"): out.append(f"SP  - {meta['pages']}")
+    if meta.get("doi"): out.append(f"DO  - {meta['doi']}")
+    out.append("ER  - ")
+    return "\n".join(out) + "\n\n"
 
-# Processing user inputs
-if st.button("Search & Convert"):
-    if not inp or not inp.strip():
-        st.warning("Please paste at least one title or DOI (one per line).")
+# ----------------------------- PROCESS ---------------------------------------
+
+if st.button("Parse + Search + Convert"):
+    if not raw_input_text.strip():
+        st.error("Please paste some references.")
         st.stop()
 
-    lines = [l.strip() for l in inp.splitlines() if l.strip()]
-    results = []
+    references = [r.strip() for r in raw_input_text.split("\n\n") if r.strip()]
+
+    all_ris = ""
     progress = st.progress(0)
-    for i, line in enumerate(lines, start=1):
-        found_meta = None
-        err = None
-        doi = is_doi(line)
-        # 1) Try Crossref by DOI
+
+    for i, ref in enumerate(references, start=1):
+        st.subheader(f"Reference {i}")
+
+        # -------- Step 1: AI Metadata extraction --------
+        ai_meta = ai_extract_metadata(ref)
+        st.write("### 🔍 AI Extracted Metadata")
+        st.json(ai_meta)
+
+        title = ai_meta.get("title", "")
+        doi = ai_meta.get("doi", "")
+        final_meta = None
+
+        # -------- Step 2: Crossref by DOI --------
         if doi and use_crossref:
-            meta, err = crossref_lookup_by_doi(doi, timeout=timeout_seconds)
-            if meta:
-                found_meta = meta
-        # 2) If not found and Crossref enabled, try Crossref title search
-        if not found_meta and use_crossref:
-            meta, err = crossref_search_title(line, timeout=timeout_seconds)
-            if meta:
-                found_meta = meta
-        # 3) If not found and PubMed enabled, try PubMed DOI search (if DOI) then title
-        if not found_meta and use_pubmed and doi:
-            meta, err = pubmed_search_by_doi(doi, timeout=timeout_seconds)
-            if meta:
-                found_meta = meta
-        if not found_meta and use_pubmed:
-            meta, err = pubmed_search_by_title(line, timeout=timeout_seconds)
-            if meta:
-                found_meta = meta
+            final_meta = crossref_lookup_by_doi(doi)
 
-        # If still not found, create placeholder metadata with original text as title
-        if not found_meta:
-            found_meta = {
-                "title": line,
-                "authors": [],
-                "journal": "",
-                "year": "",
-                "volume": "",
-                "issue": "",
-                "pages": "",
-                "doi": doi or ""
-            }
+        # -------- Step 3: Crossref by Title --------
+        if not final_meta and use_crossref and title:
+            final_meta = crossref_search_title(title)
 
-        ris = meta_to_ris(found_meta)
-        results.append({"input": line, "meta": found_meta, "ris": ris, "error": err})
-        progress.progress(i / len(lines))
-        time.sleep(0.05)
+        # -------- Step 4: PubMed Search --------
+        if not final_meta and use_pubmed:
+            final_meta = pubmed_search_title(title)
 
-    # Show results
-    st.success(f"Processed {len(results)} entries")
-    combined_ris = ""
-    for idx, r in enumerate(results, start=1):
-        st.subheader(f"{idx}. Input: {r['input']}")
-        if r["error"]:
-            st.error(f"Warning (HTTP/parse error): {r['error']}")
-        m = r["meta"]
-        col1, col2 = st.columns([2,3])
-        with col1:
-            st.markdown("**Found metadata**")
-            st.write("Title:", m.get("title",""))
-            st.write("Journal:", m.get("journal",""))
-            st.write("Year:", m.get("year",""))
-            if m.get("doi"):
-                st.write("DOI:", m.get("doi"))
-        with col2:
-            st.markdown("**Authors (preview)**")
-            authors_preview = []
-            for a in m.get("authors", [])[:12]:
-                if isinstance(a, dict):
-                    authors_preview.append(f"{a.get('family','')}, {a.get('given','')}".strip().strip(','))
-                else:
-                    authors_preview.append(str(a))
-            st.write(authors_preview or "—")
-        with st.expander("RIS for this entry"):
-            st.code(r["ris"], language="text")
-        combined_ris += r["ris"]
+        # -------- Step 5: If still nothing, use AI metadata --------
+        if not final_meta:
+            final_meta = ai_meta
 
-    # Download button for combined RIS
-    st.markdown("---")
-    st.download_button("Download combined RIS", data=combined_ris, file_name="references.ris", mime="application/x-research-info-systems")
-    st.caption("Notes: Crossref often gives best structured metadata if DOI or exact title match. PubMed is used as alternate source for biomedical literature.")
+        st.write("### 📘 Final Merged Metadata")
+        st.json(final_meta)
+
+        ris_entry = to_ris(final_meta)
+        all_ris += ris_entry
+
+        with st.expander(f"RIS for Reference {i}"):
+            st.code(ris_entry, language="text")
+
+        progress.progress(i / len(references))
+
+    st.success("All references processed!")
+    st.download_button("⬇️ Download All as RIS", data=all_ris, file_name="references.ris")
+
