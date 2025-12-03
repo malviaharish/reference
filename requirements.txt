@@ -6,3 +6,6 @@ requests
 PyPDF2
 scholarly
 pytest
+openai>=1.40.0
+python-dotenv
+requests
