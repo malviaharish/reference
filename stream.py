@@ -190,3 +190,4 @@ if st.button("Process References"):
     ris_text = "\n".join(ris_entries)
     st.download_button("Download RIS", data=ris_text, file_name="references.ris", mime="application/x-research-info-systems")
     st.text_area("RIS Preview", ris_text, height=400)
+
