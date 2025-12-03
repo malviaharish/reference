@@ -36,7 +36,7 @@ else:
     OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 
 OPENAI_MODEL = "gpt-4o"  # change if you need
-DEFAULT_THRESHOLD = 0.65
+DEFAULT_THRESHOLD = 0.3
 
 # Simple in-memory cache (per-run)
 API_CACHE: Dict[str, Any] = {}
@@ -137,48 +137,43 @@ def _split_block_numbered_or_heuristic(block: str) -> List[str]:
             return parts
     return refs
 
-# -------------------------
-# Simple local parser (fallback)
-# -------------------------
-def simple_local_parse(ref_text: str) -> Dict[str,Any]:
-    txt = clean_and_join_broken_lines(ref_text)
-    parsed = {"authors": [], "title": "", "journal": "", "year": "", "volume": "", "issue": "", "pages": "", "doi": ""}
-    # DOI detection
-    m = DOI_RE.search(txt)
-    if m:
-        parsed["doi"] = m.group(0).rstrip(',.')
-    # Year
-    y = re.search(r"\b(19|20)\d{2}\b", txt)
-    if y:
-        parsed["year"] = y.group(0)
-    # Attempt split: authors . title . journal ...
-    parts = re.split(r"\.\s+", txt)
-    if len(parts) >= 3:
-        parsed["authors"] = [a.strip().rstrip('.') for a in re.split(r";|, (?=[A-Z][a-z])", parts[0]) if a.strip()]
-        parsed["title"] = parts[1].strip()
-        rest = ". ".join(parts[2:]).strip()
-        vp = re.search(r"(?P<journal>.*?)(?:\s+)(?P<vol>\d+)\s*[:(]\s*(?P<pages>[\d\-–]+)", rest)
-        if vp:
-            parsed["journal"] = vp.group("journal").strip().rstrip(',')
-            parsed["volume"] = vp.group("vol") or ""
-            parsed["pages"] = vp.group("pages") or ""
-        else:
-            parsed["journal"] = parts[2].strip()
-    elif len(parts) == 2:
-        parsed["title"] = parts[0].strip()
-        parsed["journal"] = parts[1].strip()
-    else:
-        q = re.search(r'“([^”]+)”|"([^"]+)"', txt)
-        if q:
-            title = q.group(1) or q.group(2)
-            parsed["title"] = title.strip()
-        else:
-            parsed["title"] = txt[:120].strip()
-    pg = re.search(r"(\d{1,4}\s*[-–]\s*\d{1,4})", txt)
-    if pg:
-        parsed["pages"] = pg.group(1).replace(" ", "")
-    return parsed
 
+def openai_parse(ref_text: str) -> Dict[str, Any]:
+    """Parse reference using OpenAI API"""
+    client = openai.OpenAI()
+    
+    prompt = f"""Extract the following fields from this reference text and return as JSON:
+- authors (list of author names)
+- title (publication title)
+- journal (journal/publication name)
+- year (publication year)
+- volume (volume number)
+- issue (issue number)
+- pages (page numbers)
+- doi (DOI if present)
+
+Reference text:
+{ref_text}
+
+Return ONLY valid JSON with these fields. Use null for missing fields."""
+    
+    response = client.chat.completions.create(
+        model="gpt-3.5-turbo",
+        messages=[
+            {"role": "system", "content": "You are a reference parsing assistant. Extract bibliographic information and return only valid JSON."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.3
+    )
+    
+    import json
+    try:
+        parsed = json.loads(response.choices[0].message.content)
+    except json.JSONDecodeError:
+        parsed = {"authors": [], "title": "", "journal": "", "year": "", "volume": "", "issue": "", "pages": "", "doi": ""}
+    
+    return parsed
+    
 # -------------------------
 # OpenAI parsing (optional)
 # -------------------------
@@ -1108,5 +1103,6 @@ def test_pubmed_search_title_caching():
         
         # Should not make additional API calls
         assert call_count_2 == call_count_1
+
 
 
