@@ -20,6 +20,7 @@ import streamlit as st
 from typing import List, Tuple, Optional, Dict, Any
 from difflib import SequenceMatcher
 from pypdf import PdfReader
+from openai import OpenAI
 
 st.set_page_config(page_title="Reference → RIS (compare Found vs AI)", layout="wide")
 
@@ -32,7 +33,7 @@ if "OPENAI_API_KEY" in st.secrets:
 else:
     OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 
-OPENAI_MODEL = "gpt-4o-mini"
+OPENAI_MODEL = "gpt-4o"
 DEFAULT_THRESHOLD = 0.3
 
 # Simple in-memory cache (per-run)
@@ -822,4 +823,5 @@ if "processed_refs" in st.session_state:
                     st.code(csv_data, language="text")
 
 st.caption("OpenAI extracts title from each reference, then searches multiple metadata sources. Set threshold to control match strictness.")
+
 
