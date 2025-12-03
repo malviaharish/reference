@@ -32,7 +32,7 @@ if "OPENAI_API_KEY" in st.secrets:
 else:
     OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 
-OPENAI_MODEL = "gpt-4o"
+OPENAI_MODEL = "gpt-4o-mini"
 DEFAULT_THRESHOLD = 0.3
 
 # Simple in-memory cache (per-run)
@@ -822,3 +822,4 @@ if "processed_refs" in st.session_state:
                     st.code(csv_data, language="text")
 
 st.caption("OpenAI extracts title from each reference, then searches multiple metadata sources. Set threshold to control match strictness.")
+
