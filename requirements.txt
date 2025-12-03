@@ -9,3 +9,5 @@ pytest
 openai>=1.40.0
 python-dotenv
 requests
+python-dateutil
+openai>=1.0.0
