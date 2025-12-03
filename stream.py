@@ -1,622 +1,306 @@
-import re
-import requests
+# app.py
+"""
+Streamlit app: search Crossref + PubMed by title or DOI and convert results to RIS
+Requirements: streamlit, requests, pypdf (optional for PDF), python-dateutil
+Install with:
+pip install streamlit requests python-dateutil
+Run:
+streamlit run app.py
+"""
+
 import streamlit as st
-from pypdf import PdfReader
+import requests
+import re
 import io
+import time
+from typing import Optional, Dict, Any, Tuple, List
+from xml.etree import ElementTree as ET
+from dateutil import parser as dateparser
 
+st.set_page_config(page_title="Title/DOI → Search (Crossref / PubMed) → RIS", layout="wide")
 
-def extract_text_from_pdf(pdf_file):
-    """
-    Extracts text from an uploaded PDF file.
-    Returns the full text content as a string.
-    """
+DOI_RE = re.compile(r"10\.\d{4,9}/[-._;()/:A-Za-z0-9]+")
+CROSSREF_API = "https://api.crossref.org/works"
+EUTILS_SEARCH = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+EUTILS_FETCH = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
+
+st.title("🔎 Title/DOI → Crossref & PubMed → RIS")
+st.markdown(
+    "Paste one **title or DOI per line**. App will try Crossref (DOI exact or title search) then PubMed, show found metadata and let you download results as **RIS**."
+)
+
+with st.expander("Example inputs (copy/paste)"):
+    st.code("""10.1002/jbm.b.30864
+Recent advances in silicone pressure-sensitive adhesives
+Tissues and bone adhesives – historical aspects""")
+
+inp = st.text_area("Titles or DOIs (one per line)", height=220)
+use_crossref = st.checkbox("Use Crossref (recommended)", value=True)
+use_pubmed = st.checkbox("Use PubMed (fallback)", value=True)
+timeout_seconds = st.slider("HTTP timeout (seconds)", 5, 30, 10)
+
+def is_doi(s: str) -> Optional[str]:
+    if not s:
+        return None
+    s = s.strip()
+    m = DOI_RE.search(s)
+    return m.group(0) if m else None
+
+def crossref_lookup_by_doi(doi: str, timeout: int=10) -> Tuple[Optional[Dict[str,Any]], Optional[str]]:
     try:
-        pdf_reader = PdfReader(pdf_file)
-        text = ""
-        for page in pdf_reader.pages:
-            text += page.extract_text() + "\n"
-        return text
-    except Exception as e:
-        return f"Error extracting text from PDF: {str(e)}"
-
-
-def detect_reference_style(text):
-    """
-    Attempts to detect the citation style used in the references.
-    Returns a tuple of (detected_style, confidence_level)
-    """
-    patterns = {
-        'APA': {
-            'author_year': r'\b[A-Z][a-z]+,\s+[A-Z]\.\s*(?:&|and)\s+[A-Z][a-z]+,\s+[A-Z]\.\s*\(\d{4}\)',
-            'journal_style': r'\.\s+[A-Z][^.]+\.\s+\d+\(\d+\)',
-        },
-        'MLA': {
-            'author_title': r'\b[A-Z][a-z]+,\s+[A-Z][a-z]+\.\s+"[^"]+\."',
-            'title_quotes': r'"[^"]+\."',
-        },
-        'Chicago': {
-            'footnote_style': r'\d+\.\s+[A-Z][a-z]+,\s+[A-Z][a-z]+',
-            'publisher': r':\s+[A-Z][^,]+,\s+\d{4}',
-        },
-        'IEEE': {
-            'bracket_number': r'\[\d+\]\s+[A-Z]',
-            'et_al': r'et\s+al\.',
-        }
-    }
-    
-    style_scores = {}
-    
-    for style, style_patterns in patterns.items():
-        score = 0
-        for pattern_name, pattern in style_patterns.items():
-            matches = re.findall(pattern, text)
-            score += len(matches)
-        style_scores[style] = score
-    
-    if max(style_scores.values()) == 0:
-        return "Unknown", "Low"
-    
-    detected_style = max(style_scores, key=style_scores.get)
-    max_score = style_scores[detected_style]
-    
-    if max_score >= 3:
-        confidence = "High"
-    elif max_score >= 1:
-        confidence = "Medium"
-    else:
-        confidence = "Low"
-    
-    return detected_style, confidence
-
-
-def split_numbered_references(text):
-    """
-    Takes raw pasted reference text and splits it into complete reference blocks.
-    Works for formats like:
-    1. First line
-       continuation line...
-    2. Next reference...
-    """
-    lines = text.splitlines()
-    refs = []
-    current = []
-
-    for line in lines:
-        if re.match(r"^\s*\d+[\.\)]\s*", line):
-            if current:
-                refs.append(" ".join(current).strip())
-                current = []
-            line = re.sub(r"^\s*\d+[\.\)]\s*", "", line).strip()
-            current.append(line)
-        else:
-            if line.strip():
-                current.append(line.strip())
-
-    if current:
-        refs.append(" ".join(current).strip())
-
-    return refs
-
-
-def validate_reference(ref_text):
-    """
-    Validates a reference text for basic completeness.
-    Returns (is_valid, issues_list)
-    """
-    issues = []
-    
-    if len(ref_text) < 20:
-        issues.append("Reference seems too short")
-    
-    if not any(char.isdigit() for char in ref_text):
-        issues.append("No year/date detected")
-    
-    if ref_text.count(',') < 1:
-        issues.append("Missing commas (incomplete citation?)")
-    
-    return len(issues) == 0, issues
-
-
-def detect_duplicates(results):
-    """
-    Detects duplicate references based on DOI.
-    Returns dict mapping index to list of duplicate indices.
-    """
-    duplicates = {}
-    doi_to_indices = {}
-    
-    for idx, result in enumerate(results):
-        if result['found'] and result['doi']:
-            doi = result['doi']
-            if doi in doi_to_indices:
-                if doi not in duplicates:
-                    duplicates[doi] = [doi_to_indices[doi]]
-                duplicates[doi].append(idx)
-            else:
-                doi_to_indices[doi] = idx
-    
-    return duplicates
-
-
-def search_crossref(ref_text):
-    url = "https://api.crossref.org/works"
-    params = {"query": ref_text, "rows": 1}
-
-    try:
-        r = requests.get(url, params=params, timeout=10)
+        url = f"{CROSSREF_API}/{requests.utils.requote_uri(doi)}"
+        r = requests.get(url, timeout=timeout)
         r.raise_for_status()
-        data = r.json()
+        data = r.json().get("message", {})
+        return crossref_item_to_meta(data), None
+    except Exception as e:
+        return None, str(e)
 
-        items = data["message"].get("items", [])
-        if items:
-            item = items[0]
-            doi = item.get("DOI", "")
-            return item, doi
-    except:
-        return None, ""
+def crossref_search_title(title: str, timeout: int=10) -> Tuple[Optional[Dict[str,Any]], Optional[str]]:
+    try:
+        params = {"query.title": title, "rows": 1}
+        r = requests.get(CROSSREF_API, params=params, timeout=timeout)
+        r.raise_for_status()
+        items = r.json().get("message", {}).get("items", [])
+        if not items:
+            return None, None
+        return crossref_item_to_meta(items[0]), None
+    except Exception as e:
+        return None, str(e)
 
-    return None, ""
-
-
-def convert_to_ris(item):
-    if not item:
-        return ""
-
-    authors = item.get("author", [])
-    au_lines = ""
-
-    for a in authors:
-        family = a.get("family", "")
-        given = a.get("given", "")
-        name = f"{family}, {given}".strip().strip(",")
-        au_lines += f"AU  - {name}\n"
-
-    year = ""
-    if "issued" in item and "date-parts" in item["issued"]:
-        year = item["issued"]["date-parts"][0][0]
-
-    ris = (
-        "TY  - JOUR\n"
-        f"TI  - {item.get('title', [''])[0]}\n"
-        f"JO  - {item.get('container-title', [''])[0]}\n"
-        f"PY  - {year}\n"
-        f"{au_lines}"
-        f"DO  - {item.get('DOI', '')}\n"
-        "ER  - \n\n"
-    )
-    return ris
-
-
-def convert_to_bibtex(item):
-    if not item:
-        return ""
-    
-    authors = item.get("author", [])
-    author_list = []
-    for a in authors:
-        family = a.get("family", "")
-        given = a.get("given", "")
-        author_list.append(f"{given} {family}".strip())
-    
-    year = ""
-    if "issued" in item and "date-parts" in item["issued"]:
-        year = str(item["issued"]["date-parts"][0][0])
-    
-    title = item.get('title', [''])[0]
-    journal = item.get('container-title', [''])[0]
-    doi = item.get('DOI', '')
-    
-    cite_key = f"{authors[0].get('family', 'Unknown')}{year}" if authors else f"Unknown{year}"
-    
-    bibtex = f"""@article{{{cite_key},
-  author = {{{" and ".join(author_list)}}},
-  title = {{{title}}},
-  journal = {{{journal}}},
-  year = {{{year}}},
-  doi = {{{doi}}}
-}}
-
-"""
-    return bibtex
-
-
-def convert_to_endnote(item):
-    if not item:
-        return ""
-    
-    authors = item.get("author", [])
-    author_lines = ""
-    for a in authors:
-        family = a.get("family", "")
-        given = a.get("given", "")
-        author_lines += f"%A {given} {family}\n".strip() + "\n"
-    
-    year = ""
-    if "issued" in item and "date-parts" in item["issued"]:
-        year = str(item["issued"]["date-parts"][0][0])
-    
-    title = item.get('title', [''])[0]
-    journal = item.get('container-title', [''])[0]
-    doi = item.get('DOI', '')
-    
-    endnote = f"""%0 Journal Article
-%T {title}
-{author_lines}%D {year}
-%J {journal}
-%R {doi}
-
-"""
-    return endnote
-
-
-def convert_to_apa(item):
-    if not item:
-        return ""
-    
-    authors = item.get("author", [])
-    if len(authors) == 0:
-        author_str = "Unknown Author"
-    elif len(authors) == 1:
-        a = authors[0]
-        author_str = f"{a.get('family', '')}, {a.get('given', '')}"
-    elif len(authors) == 2:
-        a1 = authors[0]
-        a2 = authors[1]
-        author_str = f"{a1.get('family', '')}, {a1.get('given', '')}, & {a2.get('family', '')}, {a2.get('given', '')}"
-    else:
-        author_list = []
-        for i, a in enumerate(authors[:-1]):
-            author_list.append(f"{a.get('family', '')}, {a.get('given', '')}")
-        last = authors[-1]
-        author_str = ", ".join(author_list) + f", & {last.get('family', '')}, {last.get('given', '')}"
-    
-    year = ""
-    if "issued" in item and "date-parts" in item["issued"]:
-        year = str(item["issued"]["date-parts"][0][0])
-    
-    title = item.get('title', [''])[0]
-    journal = item.get('container-title', [''])[0]
-    doi = item.get('DOI', '')
-    
-    apa = f"{author_str} ({year}). {title}. {journal}. https://doi.org/{doi}\n\n"
-    return apa
-
-
-st.set_page_config(page_title="Reference Converter", page_icon="📚", layout="wide")
-
-st.title("📚 Reference Converter")
-st.markdown("Convert your numbered academic references into multiple citation formats using the Crossref API")
-
-input_method = st.radio(
-    "Choose input method:",
-    options=["📄 Upload PDF", "✍️ Paste Text"],
-    horizontal=True
-)
-
-reference_text = ""
-detected_style = None
-detected_confidence = None
-
-if input_method == "📄 Upload PDF":
-    st.info("**Upload a PDF** containing references. The app will automatically extract text and detect the citation style.")
-    
-    uploaded_file = st.file_uploader(
-        "Choose a PDF file",
-        type=['pdf'],
-        help="Upload a PDF file containing academic references"
-    )
-    
-    if uploaded_file is not None:
-        with st.spinner("Extracting text from PDF..."):
-            pdf_text = extract_text_from_pdf(uploaded_file)
-        
-        if not pdf_text.startswith("Error"):
-            st.success("✅ PDF text extracted successfully!")
-            
-            with st.spinner("Detecting citation style..."):
-                detected_style, detected_confidence = detect_reference_style(pdf_text)
-            
-            col_style1, col_style2 = st.columns(2)
-            with col_style1:
-                st.metric("Detected Citation Style", detected_style)
-            with col_style2:
-                confidence_color = "🟢" if detected_confidence == "High" else "🟡" if detected_confidence == "Medium" else "🔴"
-                st.metric("Confidence Level", f"{confidence_color} {detected_confidence}")
-            
-            with st.expander("📄 View Extracted Text", expanded=False):
-                st.text_area("Extracted PDF Content", pdf_text, height=200)
-            
-            reference_text = pdf_text
+def crossref_item_to_meta(item: Dict[str,Any]) -> Dict[str,Any]:
+    authors = []
+    for a in item.get("author", []) or []:
+        fam = a.get("family", "")
+        giv = a.get("given", "")
+        if fam or giv:
+            authors.append({"family": fam, "given": giv})
+    title = ""
+    if item.get("title"):
+        if isinstance(item["title"], list):
+            title = item["title"][0]
         else:
-            st.error(pdf_text)
+            title = item["title"]
+    year = ""
+    try:
+        issued = item.get("issued", {}).get("date-parts", [[]])
+        if issued and issued[0]:
+            year = str(issued[0][0])
+    except Exception:
+        year = ""
+    meta = {
+        "title": title,
+        "authors": authors,
+        "journal": item.get("container-title", [""])[0] if item.get("container-title") else "",
+        "year": year,
+        "volume": str(item.get("volume","") or ""),
+        "issue": str(item.get("issue","") or ""),
+        "pages": item.get("page","") or "",
+        "doi": item.get("DOI","") or ""
+    }
+    return meta
 
-else:
-    st.info("**Paste your references** below (formats like '1.' or '1)' are supported). Each reference can span multiple lines.")
-    
-    reference_text = st.text_area(
-        "Paste your references here:",
-        height=300,
-        placeholder="Example:\n1. Smith, J., & Jones, A. (2020). Article title.\n   Journal Name, 15(2), 123-145.\n2. Brown, B. (2019). Another article...",
-        help="Paste references exactly as copied. Multi-line references are supported."
-    )
-    
-    if reference_text.strip():
-        with st.spinner("Detecting citation style..."):
-            detected_style, detected_confidence = detect_reference_style(reference_text)
-        
-        col_style1, col_style2 = st.columns(2)
-        with col_style1:
-            st.metric("Detected Citation Style", detected_style)
-        with col_style2:
-            confidence_color = "🟢" if detected_confidence == "High" else "🟡" if detected_confidence == "Medium" else "🔴"
-            st.metric("Confidence Level", f"{confidence_color} {detected_confidence}")
+def pubmed_search_by_title(title: str, timeout: int=10) -> Tuple[Optional[Dict[str,Any]], Optional[str]]:
+    try:
+        params = {"db": "pubmed", "term": title + "[Title]", "retmax": 1, "retmode": "xml"}
+        r = requests.get(EUTILS_SEARCH, params=params, timeout=timeout)
+        r.raise_for_status()
+        root = ET.fromstring(r.content)
+        id_elems = root.findall(".//Id")
+        if not id_elems:
+            return None, None
+        pmid = id_elems[0].text
+        return pubmed_fetch_by_pmid(pmid, timeout=timeout)
+    except Exception as e:
+        return None, str(e)
 
-export_format = st.selectbox(
-    "Export Format:",
-    options=["RIS", "BibTeX", "EndNote", "APA"],
-    help="Choose the output format for your references"
-)
+def pubmed_search_by_doi(doi: str, timeout: int=10) -> Tuple[Optional[Dict[str,Any]], Optional[str]]:
+    try:
+        params = {"db": "pubmed", "term": doi + "[AID]", "retmax": 1, "retmode": "xml"}
+        r = requests.get(EUTILS_SEARCH, params=params, timeout=timeout)
+        r.raise_for_status()
+        root = ET.fromstring(r.content)
+        id_elems = root.findall(".//Id")
+        if not id_elems:
+            return None, None
+        pmid = id_elems[0].text
+        return pubmed_fetch_by_pmid(pmid, timeout=timeout)
+    except Exception as e:
+        return None, str(e)
 
-if 'field_edits' not in st.session_state:
-    st.session_state.field_edits = {}
-
-if st.button("Convert References", type="primary", use_container_width=True):
-    if not reference_text.strip():
-        st.warning("Please paste some references first.")
-    else:
-        references = split_numbered_references(reference_text)
-        
-        if not references:
-            st.warning("No numbered references detected. Make sure your references are numbered (e.g., 1., 2., etc.)")
-        else:
-            st.success(f"Detected {len(references)} reference(s)")
-            
-            validation_warnings = []
-            for idx, ref in enumerate(references, 1):
-                is_valid, issues = validate_reference(ref)
-                if not is_valid:
-                    validation_warnings.append((idx, issues))
-            
-            if validation_warnings:
-                with st.expander("⚠️ Validation Warnings", expanded=False):
-                    for ref_num, issues in validation_warnings:
-                        st.warning(f"**Reference {ref_num}:** {', '.join(issues)}")
-            
-            format_converters = {
-                "RIS": convert_to_ris,
-                "BibTeX": convert_to_bibtex,
-                "EndNote": convert_to_endnote,
-                "APA": convert_to_apa
-            }
-            
-            converter = format_converters[export_format]
-            
-            all_output = ""
-            results = []
-            
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            
-            for idx, ref in enumerate(references):
-                status_text.text(f"Processing reference {idx + 1} of {len(references)}...")
-                
-                item, doi = search_crossref(ref)
-                
-                if doi:
-                    all_output += converter(item)
-                    results.append({
-                        "ref": ref,
-                        "doi": doi,
-                        "title": item.get('title', [''])[0] if item else "",
-                        "item": item,
-                        "found": True
-                    })
-                else:
-                    results.append({
-                        "ref": ref,
-                        "doi": None,
-                        "title": "",
-                        "item": None,
-                        "found": False
-                    })
-                
-                progress_bar.progress((idx + 1) / len(references))
-            
-            status_text.empty()
-            progress_bar.empty()
-                
-            st.session_state.results = results
-            st.session_state.all_output = all_output
-            st.session_state.export_format = export_format
-            st.session_state.field_edits = {}
-
-if 'results' in st.session_state and st.session_state.results:
-    results = st.session_state.results
-    all_output = st.session_state.all_output
-    current_export_format = st.session_state.export_format
-    
-    duplicates = detect_duplicates(results)
-    if duplicates:
-        with st.expander("🔍 Duplicate References Detected", expanded=True):
-            for doi, indices in duplicates.items():
-                ref_numbers = [i + 1 for i in indices]
-                st.error(f"**DOI {doi}** appears in references: {', '.join(map(str, ref_numbers))}")
-                st.caption("Consider removing duplicate entries before exporting.")
-    
-    st.subheader("Results & Reference Editing")
-    st.info("Edit any reference details below. Changes will be reflected in the export.")
-    
-    for idx, result in enumerate(results, 1):
-        with st.expander(f"Reference {idx}: {'✅ DOI Found' if result['found'] else '❌ No DOI'}"):
-            st.text(f"Original: {result['ref'][:150]}{'...' if len(result['ref']) > 150 else ''}")
-            
-            if result['found']:
-                st.success(f"**DOI:** {result['doi']}")
-                
-                item = result['item']
-                
-                with st.form(key=f"edit_form_{idx}"):
-                    st.markdown("**Edit Reference Fields:**")
-                    
-                    edited_title = st.text_input(
-                        "Title:",
-                        value=item.get('title', [''])[0],
-                        key=f"title_{idx}"
-                    )
-                    
-                    edited_journal = st.text_input(
-                        "Journal:",
-                        value=item.get('container-title', [''])[0],
-                        key=f"journal_{idx}"
-                    )
-                    
-                    year = ""
-                    if "issued" in item and "date-parts" in item["issued"]:
-                        year = str(item["issued"]["date-parts"][0][0])
-                    
-                    edited_year = st.text_input(
-                        "Year:",
-                        value=year,
-                        key=f"year_{idx}"
-                    )
-                    
-                    edited_doi = st.text_input(
-                        "DOI:",
-                        value=result['doi'],
-                        key=f"doi_{idx}"
-                    )
-                    
-                    submit_edits = st.form_submit_button("Save Edits")
-                    
-                    if submit_edits:
-                        if 'field_edits' not in st.session_state:
-                            st.session_state.field_edits = {}
-                        st.session_state.field_edits[idx - 1] = {
-                            'title': edited_title,
-                            'journal': edited_journal,
-                            'year': edited_year,
-                            'doi': edited_doi
-                        }
-                        st.success("✅ Edits saved! Click 'Regenerate Export' below to apply changes.")
+def pubmed_fetch_by_pmid(pmid: str, timeout: int=10) -> Tuple[Optional[Dict[str,Any]], Optional[str]]:
+    try:
+        params = {"db": "pubmed", "id": pmid, "retmode": "xml"}
+        r = requests.get(EUTILS_FETCH, params=params, timeout=timeout)
+        r.raise_for_status()
+        root = ET.fromstring(r.content)
+        # Title
+        atitle = root.find(".//ArticleTitle")
+        title = atitle.text if atitle is not None else ""
+        # Authors
+        authors = []
+        for author in root.findall(".//Author"):
+            ln = author.find("LastName")
+            fn = author.find("ForeName")
+            if ln is not None:
+                authors.append({"family": ln.text or "", "given": fn.text or ""})
+        # Journal
+        j = root.find(".//Journal/Title")
+        journal = j.text if j is not None else ""
+        # Year
+        year = ""
+        # PubDate may be year or medline date
+        pubdate = root.find(".//PubDate")
+        if pubdate is not None:
+            # try Year
+            y = pubdate.find("Year")
+            if y is not None and y.text:
+                year = y.text
             else:
-                st.warning("Could not find DOI for this reference")
-                
-                with st.form(key=f"manual_form_{idx}"):
-                    st.markdown("**Manually Add Reference Details:**")
-                    
-                    manual_title = st.text_input(
-                        "Title:",
-                        key=f"manual_title_{idx}"
-                    )
-                    
-                    manual_journal = st.text_input(
-                        "Journal:",
-                        key=f"manual_journal_{idx}"
-                    )
-                    
-                    manual_year = st.text_input(
-                        "Year:",
-                        key=f"manual_year_{idx}"
-                    )
-                    
-                    manual_doi = st.text_input(
-                        "DOI:",
-                        key=f"manual_doi_{idx}",
-                        placeholder="10.1234/example.doi"
-                    )
-                    
-                    submit_manual = st.form_submit_button("Add Manual Entry")
-                    
-                    if submit_manual and manual_doi:
-                        if 'field_edits' not in st.session_state:
-                            st.session_state.field_edits = {}
-                        st.session_state.field_edits[idx - 1] = {
-                            'title': manual_title,
-                            'journal': manual_journal,
-                            'year': manual_year,
-                            'doi': manual_doi
-                        }
-                        st.success("✅ Manual entry saved! Click 'Regenerate Export' below to apply.")
-    
-    if st.session_state.field_edits:
-        st.divider()
-        if st.button("🔄 Regenerate Export with Edits", use_container_width=True):
-            format_converters = {
-                "RIS": convert_to_ris,
-                "BibTeX": convert_to_bibtex,
-                "EndNote": convert_to_endnote,
-                "APA": convert_to_apa
-            }
-            
-            converter = format_converters[current_export_format]
-            updated_output = ""
-            
-            saved_edits = st.session_state.field_edits
-            
-            for idx, result in enumerate(results):
-                if idx in saved_edits:
-                    edits = saved_edits[idx]
-                    
-                    if result['item']:
-                        updated_item = result['item'].copy()
-                    else:
-                        updated_item = {
-                            'author': [],
-                            'issued': {'date-parts': [[0]]}
-                        }
-                    
-                    updated_item['title'] = [edits['title']]
-                    updated_item['container-title'] = [edits['journal']]
-                    updated_item['DOI'] = edits['doi']
-                    
+                # find MedlineDate or try parse
+                md = pubdate.find("MedlineDate")
+                if md is not None and md.text:
                     try:
-                        year_int = int(edits['year']) if edits['year'] else 0
-                        updated_item['issued'] = {'date-parts': [[year_int]]}
-                    except ValueError:
-                        updated_item['issued'] = {'date-parts': [[0]]}
-                    
-                    updated_output += converter(updated_item)
-                else:
-                    if result['item']:
-                        updated_output += converter(result['item'])
-            
-            st.session_state.all_output = updated_output
-            all_output = updated_output
-            st.success("✅ Export regenerated with your edits!")
-    
-    if all_output:
-        st.subheader(f"{current_export_format} Output")
-        
-        file_extensions = {
-            "RIS": "ris",
-            "BibTeX": "bib",
-            "EndNote": "enw",
-            "APA": "txt"
+                        year = str(dateparser.parse(md.text, fuzzy=True).year)
+                    except Exception:
+                        year = ""
+        # Volume/Issue/Pages
+        vol = (root.find(".//Volume").text if root.find(".//Volume") is not None else "") or ""
+        issue = (root.find(".//Issue").text if root.find(".//Issue") is not None else "") or ""
+        pages = (root.find(".//MedlinePgn").text if root.find(".//MedlinePgn") is not None else "") or ""
+        # DOI from ArticleIdList
+        doi = ""
+        for aid in root.findall(".//ArticleId"):
+            if aid.get("IdType") == "doi":
+                doi = aid.text or ""
+        meta = {
+            "title": title,
+            "authors": authors,
+            "journal": journal,
+            "year": year,
+            "volume": vol,
+            "issue": issue,
+            "pages": pages,
+            "doi": doi
         }
-        
-        mime_types = {
-            "RIS": "application/x-research-info-systems",
-            "BibTeX": "application/x-bibtex",
-            "EndNote": "application/x-endnote-refer",
-            "APA": "text/plain"
-        }
-        
-        col1, col2 = st.columns([3, 1])
+        return meta, None
+    except Exception as e:
+        return None, str(e)
+
+def meta_to_ris(meta: Dict[str,Any]) -> str:
+    """Convert a metadata dict to a RIS string for a journal article."""
+    lines = ["TY  - JOUR"]
+    title = meta.get("title","")
+    if title:
+        lines.append(f"TI  - {title}")
+    for a in meta.get("authors", []):
+        if isinstance(a, dict):
+            fam = a.get("family","").strip()
+            giv = a.get("given","").strip()
+            if giv:
+                au = f"{fam}, {giv}"
+            else:
+                au = fam
+        else:
+            au = str(a)
+        if au:
+            lines.append(f"AU  - {au}")
+    if meta.get("journal"):
+        lines.append(f"JO  - {meta.get('journal')}")
+    if meta.get("volume"):
+        lines.append(f"VL  - {meta.get('volume')}")
+    if meta.get("issue"):
+        lines.append(f"IS  - {meta.get('issue')}")
+    if meta.get("pages"):
+        lines.append(f"SP  - {meta.get('pages')}")
+    if meta.get("year"):
+        lines.append(f"PY  - {meta.get('year')}")
+    if meta.get("doi"):
+        lines.append(f"DO  - {meta.get('doi')}")
+    lines.append("ER  - ")
+    return "\n".join(lines) + "\n\n"
+
+# Processing user inputs
+if st.button("Search & Convert"):
+    if not inp or not inp.strip():
+        st.warning("Please paste at least one title or DOI (one per line).")
+        st.stop()
+
+    lines = [l.strip() for l in inp.splitlines() if l.strip()]
+    results = []
+    progress = st.progress(0)
+    for i, line in enumerate(lines, start=1):
+        found_meta = None
+        err = None
+        doi = is_doi(line)
+        # 1) Try Crossref by DOI
+        if doi and use_crossref:
+            meta, err = crossref_lookup_by_doi(doi, timeout=timeout_seconds)
+            if meta:
+                found_meta = meta
+        # 2) If not found and Crossref enabled, try Crossref title search
+        if not found_meta and use_crossref:
+            meta, err = crossref_search_title(line, timeout=timeout_seconds)
+            if meta:
+                found_meta = meta
+        # 3) If not found and PubMed enabled, try PubMed DOI search (if DOI) then title
+        if not found_meta and use_pubmed and doi:
+            meta, err = pubmed_search_by_doi(doi, timeout=timeout_seconds)
+            if meta:
+                found_meta = meta
+        if not found_meta and use_pubmed:
+            meta, err = pubmed_search_by_title(line, timeout=timeout_seconds)
+            if meta:
+                found_meta = meta
+
+        # If still not found, create placeholder metadata with original text as title
+        if not found_meta:
+            found_meta = {
+                "title": line,
+                "authors": [],
+                "journal": "",
+                "year": "",
+                "volume": "",
+                "issue": "",
+                "pages": "",
+                "doi": doi or ""
+            }
+
+        ris = meta_to_ris(found_meta)
+        results.append({"input": line, "meta": found_meta, "ris": ris, "error": err})
+        progress.progress(i / len(lines))
+        time.sleep(0.05)
+
+    # Show results
+    st.success(f"Processed {len(results)} entries")
+    combined_ris = ""
+    for idx, r in enumerate(results, start=1):
+        st.subheader(f"{idx}. Input: {r['input']}")
+        if r["error"]:
+            st.error(f"Warning (HTTP/parse error): {r['error']}")
+        m = r["meta"]
+        col1, col2 = st.columns([2,3])
         with col1:
-            st.download_button(
-                label=f"📥 Download {current_export_format} File",
-                data=all_output,
-                file_name=f"references.{file_extensions[current_export_format]}",
-                mime=mime_types[current_export_format],
-                use_container_width=True
-            )
-        
-        with st.expander(f"Preview {current_export_format} Format"):
-            st.code(all_output, language="text")
-    else:
-        st.error(f"No references could be converted to {current_export_format} format.")
+            st.markdown("**Found metadata**")
+            st.write("Title:", m.get("title",""))
+            st.write("Journal:", m.get("journal",""))
+            st.write("Year:", m.get("year",""))
+            if m.get("doi"):
+                st.write("DOI:", m.get("doi"))
+        with col2:
+            st.markdown("**Authors (preview)**")
+            authors_preview = []
+            for a in m.get("authors", [])[:12]:
+                if isinstance(a, dict):
+                    authors_preview.append(f"{a.get('family','')}, {a.get('given','')}".strip().strip(','))
+                else:
+                    authors_preview.append(str(a))
+            st.write(authors_preview or "—")
+        with st.expander("RIS for this entry"):
+            st.code(r["ris"], language="text")
+        combined_ris += r["ris"]
 
-st.divider()
-st.caption("This tool uses the Crossref API to search for DOIs and convert references to multiple citation formats.")
-
-
+    # Download button for combined RIS
+    st.markdown("---")
+    st.download_button("Download combined RIS", data=combined_ris, file_name="references.ris", mime="application/x-research-info-systems")
+    st.caption("Notes: Crossref often gives best structured metadata if DOI or exact title match. PubMed is used as alternate source for biomedical literature.")
