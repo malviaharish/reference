@@ -35,7 +35,7 @@ if "OPENAI_API_KEY" in st.secrets:
 else:
     OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 
-OPENAI_MODEL = "gpt-4o-mini"  # change if you need
+OPENAI_MODEL = "gpt-4o"  # change if you need
 DEFAULT_THRESHOLD = 0.65
 
 # Simple in-memory cache (per-run)
@@ -1108,4 +1108,5 @@ def test_pubmed_search_title_caching():
         
         # Should not make additional API calls
         assert call_count_2 == call_count_1
+
 
