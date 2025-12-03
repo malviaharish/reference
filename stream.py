@@ -12,14 +12,8 @@ st.set_page_config(page_title="Reference → RIS", layout="wide")
 # -------------------------
 # Config / secrets
 # -------------------------
-OPENAI_API_KEY = None
-if "OPENAI_API_KEY" in st.secrets:
-    OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
-else:
-    OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-
-OPENAI_MODEL = "gpt-4o"  # change to "gpt-4" if available
-DEFAULT_THRESHOLD = 0.3
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", None)
+OPENAI_MODEL = "gpt-4o-mini"
 
 # -------------------------
 # Utilities
@@ -27,14 +21,7 @@ DEFAULT_THRESHOLD = 0.3
 def normalize_text(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "")).strip()
 
-def similarity(a: str, b: str) -> float:
-    if not a or not b:
-        return 0.0
-    return SequenceMatcher(None, normalize_text(a).lower(), normalize_text(b).lower()).ratio()
-
 def extract_refs(text: str) -> List[str]:
-    """Split pasted text into individual references"""
-    # Reference number patterns: 1, 1., [1], (1)
     pattern = r"(?:\n|^)\s*(?:\[\d+\]|\(\d+\)|\d+\.)\s*(.+?)(?=\n(?:\[\d+\]|\(\d+\)|\d+\.|\Z))"
     matches = re.findall(pattern, "\n" + text + "\n", flags=re.DOTALL)
     if matches:
@@ -43,14 +30,14 @@ def extract_refs(text: str) -> List[str]:
         return [text.strip()]
 
 # -------------------------
-# OpenAI parsing (optional)
+# OpenAI parsing
 # -------------------------
 def openai_parse_reference(ref_text: str) -> Dict[str, Any]:
     if not OPENAI_API_KEY:
         return {"title": "", "doi": ""}
     
     prompt = (
-        f"Extract the **title** and **DOI** from this bibliographic reference. "
+        f"Extract the title and DOI from this reference. "
         f"Return ONLY JSON like {{\"title\": \"...\", \"doi\": \"...\"}}.\n\nReference:\n{ref_text}"
     )
     try:
@@ -74,22 +61,20 @@ def openai_parse_reference(ref_text: str) -> Dict[str, Any]:
 # Crossref search
 # -------------------------
 def crossref_search(query: str, doi: str = "") -> Dict[str, Any]:
-    if doi:
-        url = f"https://api.crossref.org/works/{doi}"
-        params = {}
-    else:
-        url = "https://api.crossref.org/works"
-        params = {"query.bibliographic": query, "rows": 1}
     try:
+        if doi:
+            url = f"https://api.crossref.org/works/{doi}"
+            params = {}
+        else:
+            url = "https://api.crossref.org/works"
+            params = {"query.bibliographic": query, "rows": 1}
         r = requests.get(url, params=params, timeout=10)
         r.raise_for_status()
         data = r.json()
         item = data.get("message") if doi else (data.get("message", {}).get("items", [None])[0])
         if not item:
             return {}
-        authors = []
-        for a in item.get("author", []):
-            authors.append(f"{a.get('family','')}, {a.get('given','')}".strip())
+        authors = [f"{a.get('family','')}, {a.get('given','')}".strip() for a in item.get("author",[])]
         return {
             "title": item.get("title", [""])[0] if item.get("title") else "",
             "authors": authors,
@@ -105,26 +90,22 @@ def crossref_search(query: str, doi: str = "") -> Dict[str, Any]:
         return {}
 
 # -------------------------
-# PubMed search by title
+# PubMed search
 # -------------------------
 def pubmed_search(title: str) -> Dict[str, Any]:
-    if not title:
-        return {}
+    if not title: return {}
     try:
-        # Search for ID
-        params = {"db": "pubmed", "term": title, "retmax": 1, "retmode": "json"}
+        params = {"db":"pubmed","term":title,"retmax":1,"retmode":"json"}
         r = requests.get("https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi", params=params, timeout=10)
         r.raise_for_status()
         ids = r.json().get("esearchresult", {}).get("idlist", [])
-        if not ids:
-            return {}
+        if not ids: return {}
         pmid = ids[0]
-        # Fetch summary
         r2 = requests.get("https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi",
                           params={"db":"pubmed","id":pmid,"retmode":"json"}, timeout=10)
         r2.raise_for_status()
         doc = r2.json().get("result", {}).get(pmid, {})
-        authors = [f"{a.get('name','')}" for a in doc.get("authors", [])]
+        authors = [a.get("name","") for a in doc.get("authors",[])]
         return {
             "title": doc.get("title",""),
             "authors": authors,
@@ -140,7 +121,7 @@ def pubmed_search(title: str) -> Dict[str, Any]:
         return {}
 
 # -------------------------
-# Convert to RIS
+# RIS conversion
 # -------------------------
 def convert_to_ris(meta: Dict[str, Any]) -> str:
     lines = ["TY  - JOUR"]
@@ -157,25 +138,24 @@ def convert_to_ris(meta: Dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 # -------------------------
-# Process each reference
+# Process reference
 # -------------------------
 def process_reference(ref: str) -> Dict[str, Any]:
     ai_data = openai_parse_reference(ref) if OPENAI_API_KEY else {"title":"", "doi":""}
     crossref_data = crossref_search(ai_data.get("title") or ref, ai_data.get("doi"))
     pubmed_data = pubmed_search(ai_data.get("title") or ref)
-    # Pick the most complete result
     chosen = crossref_data if crossref_data else pubmed_data
     return {"original": ref, "ai": ai_data, "found": chosen}
 
 # -------------------------
 # Streamlit UI
 # -------------------------
-st.title("📚 Reference → RIS Exporter")
+st.title("📚 Reference → RIS Exporter (Improved UI)")
 
 if not OPENAI_API_KEY:
-    st.warning("⚠️ OpenAI key not found. AI parsing is disabled. The app will search Crossref and PubMed only.")
+    st.warning("⚠️ OpenAI key not found. AI parsing disabled. Using Crossref & PubMed only.")
 
-raw_text = st.text_area("Paste references here (numbered, e.g., 1, 1., [1])", height=300)
+raw_text = st.text_area("Paste your references here", height=300)
 
 if st.button("Process References"):
     if not raw_text.strip():
@@ -184,23 +164,27 @@ if st.button("Process References"):
     
     refs = extract_refs(raw_text)
     st.info(f"Found {len(refs)} reference(s). Processing...")
-
     results = []
     progress = st.progress(0)
+    
     for i, r in enumerate(refs, start=1):
         rec = process_reference(r)
         results.append(rec)
         progress.progress(i/len(refs))
-        time.sleep(0.1)
+        time.sleep(0.05)
     
     st.success("Processing complete.")
-
+    
     ris_entries = []
     for idx, rec in enumerate(results, start=1):
         st.markdown(f"### Reference {idx}")
-        st.write("**Original:**", rec["original"])
-        st.write("**AI-extracted:**", rec["ai"])
-        st.write("**Found metadata:**", rec["found"])
+        col1, col2 = st.columns(2)
+        with col1:
+            st.subheader("Original Reference")
+            st.write(rec["original"])
+        with col2:
+            st.subheader("Parsed / Found Metadata")
+            st.json(rec["found"])
         ris_entries.append(convert_to_ris(rec["found"] or {}))
     
     ris_text = "\n".join(ris_entries)
