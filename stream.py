@@ -2,6 +2,7 @@
 """
 Streamlit: Paste full references → Search in Crossref & PubMed → Export RIS
 Now includes comparison table: Pasted Reference vs Extracted Metadata
+Includes PATCH 3 → Google Scholar Direct Search
 """
 
 import streamlit as st
@@ -62,7 +63,7 @@ def crossref_lookup(doi: str):
         r.raise_for_status()
         msg = r.json()["message"]
         meta = crossref_to_meta(msg)
-        meta["pubmed_id"] = ""  # 🔵 MODIFIED
+        meta["pubmed_id"] = ""  # Add empty PMID
         return meta, None
     except Exception as e:
         return None, str(e)
@@ -77,7 +78,7 @@ def crossref_fulltext_search(ref: str):
         if not items:
             return None, None
         meta = crossref_to_meta(items[0])
-        meta["pubmed_id"] = ""  # 🔵 MODIFIED
+        meta["pubmed_id"] = ""  
         return meta, None
     except Exception as e:
         return None, str(e)
@@ -127,7 +128,7 @@ def pubmed_search(ref: str):
         meta, err = pubmed_fetch(pmid)
 
         if meta:
-            meta["pubmed_id"] = pmid  # 🔵 MODIFIED
+            meta["pubmed_id"] = pmid  
 
         return meta, err
 
@@ -212,7 +213,7 @@ def to_ris(meta: dict) -> str:
         ris.append(f"SP  - {meta['pages']}")
     if meta.get("doi"):
         ris.append(f"DO  - {meta['doi']}")
-    if meta.get("pubmed_id"):  # 🔵 MODIFIED
+    if meta.get("pubmed_id"):
         ris.append(f"ID  - PMID:{meta['pubmed_id']}")
 
     ris.append("ER  - ")
@@ -255,13 +256,13 @@ if st.button("Search & Convert"):
                 "issue": "",
                 "pages": "",
                 "doi": doi or "",
-                "pubmed_id": ""      # 🔵 MODIFIED
+                "pubmed_id": ""
             }
 
-        # -------------------- EDITABLE FIELDS (NEW) -------------------- #
         st.subheader(f"Entry #{i}")
 
-        with st.form(f"edit_{i}"):   # 🔵 MODIFIED
+        # -------------------- EDITABLE FIELDS -------------------- #
+        with st.form(f"edit_{i}"):
             colA, colB = st.columns(2)
 
             with colA:
@@ -288,12 +289,12 @@ if st.button("Search & Convert"):
             result["issue"] = issue
             result["pages"] = pages
 
-        # Display table
+        # -------------------- TWO-COLUMN TABLE -------------------- #
         col1, col2 = st.columns([1, 1])
 
         with col1:
             st.markdown("### **Pasted Reference**")
-            st.code(ref, language="text")
+            st.code(ref)
 
         with col2:
             st.markdown("### **Extracted Metadata (Editable Above)**")
@@ -306,7 +307,11 @@ if st.button("Search & Convert"):
             st.write(f"**Issue:** {result['issue']}")
             st.write(f"**Pages:** {result['pages']}")
 
-        # RIS
+        # -------------------- PATCH 3: GOOGLE SCHOLAR -------------------- #
+        sch_url = f"https://scholar.google.com/scholar?q={requests.utils.quote(ref)}"
+        st.markdown(f"[🔍 **Open in Google Scholar**]({sch_url})")
+
+        # -------------------- RIS -------------------- #
         ris = to_ris(result)
         combined_ris += ris
 
