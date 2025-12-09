@@ -47,7 +47,6 @@ timeout_seconds = st.slider("HTTP timeout", 5, 30, 10)
 # ------------------------ DOI DETECTION ----------------------------- #
 
 def extract_doi(text: str) -> Optional[str]:
-    """Extract DOI from any reference line."""
     if not text:
         return None
     m = DOI_RE.search(text)
@@ -56,20 +55,20 @@ def extract_doi(text: str) -> Optional[str]:
 
 # ------------------------ CROSSREF SEARCH --------------------------- #
 
-def crossref_lookup(doi: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    """Direct DOI lookup in Crossref."""
+def crossref_lookup(doi: str):
     try:
         url = f"{CROSSREF_API}/{doi}"
         r = requests.get(url, timeout=timeout_seconds)
         r.raise_for_status()
         msg = r.json()["message"]
-        return crossref_to_meta(msg), None
+        meta = crossref_to_meta(msg)
+        meta["pubmed_id"] = ""  # 🔵 MODIFIED
+        return meta, None
     except Exception as e:
         return None, str(e)
 
 
-def crossref_fulltext_search(ref: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    """Full reference string search in Crossref."""
+def crossref_fulltext_search(ref: str):
     try:
         params = {"query.bibliographic": ref, "rows": 1}
         r = requests.get(CROSSREF_API, params=params, timeout=timeout_seconds)
@@ -77,7 +76,9 @@ def crossref_fulltext_search(ref: str) -> Tuple[Optional[Dict[str, Any]], Option
         items = r.json().get("message", {}).get("items", [])
         if not items:
             return None, None
-        return crossref_to_meta(items[0]), None
+        meta = crossref_to_meta(items[0])
+        meta["pubmed_id"] = ""  # 🔵 MODIFIED
+        return meta, None
     except Exception as e:
         return None, str(e)
 
@@ -94,7 +95,7 @@ def crossref_to_meta(item: dict) -> dict:
     try:
         dp = item.get("issued", {}).get("date-parts", [[]])
         year = str(dp[0][0])
-    except Exception:
+    except:
         pass
 
     return {
@@ -111,8 +112,7 @@ def crossref_to_meta(item: dict) -> dict:
 
 # ------------------------ PUBMED SEARCH ----------------------------- #
 
-def pubmed_search(ref: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    """PubMed search using full reference string."""
+def pubmed_search(ref: str):
     try:
         params = {"db": "pubmed", "term": ref, "retmax": 1, "retmode": "xml"}
         r = requests.get(EUTILS_SEARCH, params=params, timeout=timeout_seconds)
@@ -124,13 +124,18 @@ def pubmed_search(ref: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
             return None, None
 
         pmid = ids[0].text
-        return pubmed_fetch(pmid)
+        meta, err = pubmed_fetch(pmid)
+
+        if meta:
+            meta["pubmed_id"] = pmid  # 🔵 MODIFIED
+
+        return meta, err
+
     except Exception as e:
         return None, str(e)
 
 
-def pubmed_fetch(pmid: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    """Fetch PubMed metadata."""
+def pubmed_fetch(pmid: str):
     try:
         params = {"db": "pubmed", "id": pmid, "retmode": "xml"}
         r = requests.get(EUTILS_FETCH, params=params, timeout=timeout_seconds)
@@ -147,6 +152,7 @@ def pubmed_fetch(pmid: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
             })
 
         journal = root.findtext(".//Journal/Title", "")
+        
         year = ""
         pd = root.find(".//PubDate")
         if pd is not None:
@@ -206,6 +212,8 @@ def to_ris(meta: dict) -> str:
         ris.append(f"SP  - {meta['pages']}")
     if meta.get("doi"):
         ris.append(f"DO  - {meta['doi']}")
+    if meta.get("pubmed_id"):  # 🔵 MODIFIED
+        ris.append(f"ID  - PMID:{meta['pubmed_id']}")
 
     ris.append("ER  - ")
     return "\n".join(ris) + "\n\n"
@@ -228,19 +236,15 @@ if st.button("Search & Convert"):
         result = None
         err = None
 
-        # Crossref via DOI
         if doi and use_crossref:
             result, err = crossref_lookup(doi)
 
-        # Crossref via text search
         if not result and use_crossref:
             result, err = crossref_fulltext_search(ref)
 
-        # PubMed search
         if not result and use_pubmed:
             result, err = pubmed_search(ref)
 
-        # Fallback metadata
         if not result:
             result = {
                 "title": ref,
@@ -250,17 +254,41 @@ if st.button("Search & Convert"):
                 "volume": "",
                 "issue": "",
                 "pages": "",
-                "doi": doi or ""
+                "doi": doi or "",
+                "pubmed_id": ""      # 🔵 MODIFIED
             }
 
-        # Build RIS
-        ris = to_ris(result)
-        combined_ris += ris
-
-        # Show entry header
+        # -------------------- EDITABLE FIELDS (NEW) -------------------- #
         st.subheader(f"Entry #{i}")
 
-        # Create table
+        with st.form(f"edit_{i}"):   # 🔵 MODIFIED
+            colA, colB = st.columns(2)
+
+            with colA:
+                title = st.text_input("Title", result.get("title", ""))
+                journal = st.text_input("Journal", result.get("journal", ""))
+                year = st.text_input("Year", result.get("year", ""))
+                doi_field = st.text_input("DOI", result.get("doi", ""))
+
+            with colB:
+                pmid = st.text_input("PubMed ID", result.get("pubmed_id", ""))
+                volume = st.text_input("Volume", result.get("volume", ""))
+                issue = st.text_input("Issue", result.get("issue", ""))
+                pages = st.text_input("Pages", result.get("pages", ""))
+
+            save_btn = st.form_submit_button("Update Metadata")
+
+        if save_btn:
+            result["title"] = title
+            result["journal"] = journal
+            result["year"] = year
+            result["doi"] = doi_field
+            result["pubmed_id"] = pmid
+            result["volume"] = volume
+            result["issue"] = issue
+            result["pages"] = pages
+
+        # Display table
         col1, col2 = st.columns([1, 1])
 
         with col1:
@@ -268,13 +296,20 @@ if st.button("Search & Convert"):
             st.code(ref, language="text")
 
         with col2:
-            st.markdown("### **Extracted Metadata**")
-            st.write(f"**Title:** {result.get('title', '')}")
-            st.write(f"**Journal:** {result.get('journal', '')}")
-            st.write(f"**Year:** {result.get('year', '')}")
-            st.write(f"**DOI:** {result.get('doi', '')}")
+            st.markdown("### **Extracted Metadata (Editable Above)**")
+            st.write(f"**Title:** {result['title']}")
+            st.write(f"**Journal:** {result['journal']}")
+            st.write(f"**Year:** {result['year']}")
+            st.write(f"**DOI:** {result['doi']}")
+            st.write(f"**PubMed ID:** {result['pubmed_id']}")
+            st.write(f"**Volume:** {result['volume']}")
+            st.write(f"**Issue:** {result['issue']}")
+            st.write(f"**Pages:** {result['pages']}")
 
-        # RIS view
+        # RIS
+        ris = to_ris(result)
+        combined_ris += ris
+
         with st.expander("RIS"):
             st.code(ris, language="text")
 
@@ -282,7 +317,7 @@ if st.button("Search & Convert"):
             st.warning(f"Lookup warning: {err}")
 
         progress.progress(i / len(lines))
-        time.sleep(0.1)
+        time.sleep(0.05)
 
     st.download_button("Download Combined RIS", combined_ris, "references.ris")
     st.success("Done!")
