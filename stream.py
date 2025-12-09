@@ -1,7 +1,7 @@
 # app.py
 """
 Streamlit: Paste full references → Search in Crossref & PubMed → Export RIS
-Now search is based on the *entire reference line*, not just title.
+Now includes comparison table: Pasted Reference vs Extracted Metadata
 """
 
 import streamlit as st
@@ -114,12 +114,7 @@ def crossref_to_meta(item: dict) -> dict:
 def pubmed_search(ref: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     """PubMed search using full reference string."""
     try:
-        params = {
-            "db": "pubmed",
-            "term": ref,
-            "retmax": 1,
-            "retmode": "xml",
-        }
+        params = {"db": "pubmed", "term": ref, "retmax": 1, "retmode": "xml"}
         r = requests.get(EUTILS_SEARCH, params=params, timeout=timeout_seconds)
         r.raise_for_status()
 
@@ -181,6 +176,7 @@ def pubmed_fetch(pmid: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
             "pages": root.findtext(".//MedlinePgn", ""),
             "doi": doi,
         }, None
+
     except Exception as e:
         return None, str(e)
 
@@ -218,6 +214,7 @@ def to_ris(meta: dict) -> str:
 # ------------------------ PROCESS ----------------------------- #
 
 if st.button("Search & Convert"):
+
     if not inp.strip():
         st.warning("Paste references!")
         st.stop()
@@ -231,19 +228,19 @@ if st.button("Search & Convert"):
         result = None
         err = None
 
-        # --- CROSSREF via DOI ---
+        # Crossref via DOI
         if doi and use_crossref:
             result, err = crossref_lookup(doi)
 
-        # --- CROSSREF full reference search ---
+        # Crossref via text search
         if not result and use_crossref:
             result, err = crossref_fulltext_search(ref)
 
-        # --- PUBMED full reference search ---
+        # PubMed search
         if not result and use_pubmed:
             result, err = pubmed_search(ref)
 
-        # --- fallback fake metadata ---
+        # Fallback metadata
         if not result:
             result = {
                 "title": ref,
@@ -256,24 +253,36 @@ if st.button("Search & Convert"):
                 "doi": doi or ""
             }
 
+        # Build RIS
         ris = to_ris(result)
         combined_ris += ris
 
+        # Show entry header
         st.subheader(f"Entry #{i}")
-        if err:
-            st.warning(f"Lookup warning: {err}")
-        st.write("**Title:**", result.get("title", ""))
-        st.write("**Journal:**", result.get("journal", ""))
-        st.write("**Year:**", result.get("year", ""))
-        st.write("**DOI:**", result.get("doi", ""))
 
+        # Create table
+        col1, col2 = st.columns([1, 1])
+
+        with col1:
+            st.markdown("### **Pasted Reference**")
+            st.code(ref, language="text")
+
+        with col2:
+            st.markdown("### **Extracted Metadata**")
+            st.write(f"**Title:** {result.get('title', '')}")
+            st.write(f"**Journal:** {result.get('journal', '')}")
+            st.write(f"**Year:** {result.get('year', '')}")
+            st.write(f"**DOI:** {result.get('doi', '')}")
+
+        # RIS view
         with st.expander("RIS"):
             st.code(ris, language="text")
+
+        if err:
+            st.warning(f"Lookup warning: {err}")
 
         progress.progress(i / len(lines))
         time.sleep(0.1)
 
     st.download_button("Download Combined RIS", combined_ris, "references.ris")
     st.success("Done!")
-
-
